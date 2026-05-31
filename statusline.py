@@ -2,8 +2,8 @@
 """Claude Code statusline.
 
 Layout (lines printed top → bottom):
-    L1  🤖 model · ⚡ effort · ⎇ branch · 🧠 ctx · 📊 cache · ⏱ session · ⌛ last
-    L2  💰 block/wk/mo · 🔥 burn →wk · ✓ todos · 🔧 tools · 🌐 bg · 📝 last skill
+    L1  🤖 model v · ⚡ effort 💭 · ⎇ branch · 🧠 ctx · 📊 cache · ⏱ session · ⌛ last
+    L2  💰 block/wk/mo · 💬 session · 🔥 burn →wk · ✎ session edits · ✓ todos · 🔧 tools · 🌐 bg · 🎨 style · 📝 last skill
     L3  👥 N · ├ agent A · ├ agent B · └ agent C       (only if agents > 0)
     L4  5h ████████  ##%  (reset countdown)
     L5  7d ███       ##%  (reset countdown)
@@ -30,7 +30,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -145,11 +145,15 @@ def parse_iso(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def seconds_until(iso_ts):
-    if not iso_ts:
+def seconds_until(ts):
+    """Seconds from now until `ts`, clamped at 0. Accepts an ISO 8601 string
+    (OMC plan cache) or a Unix epoch in seconds (stdin `rate_limits.resets_at`,
+    which Claude Code derives from the `anthropic-ratelimit-unified-*-reset`
+    headers)."""
+    if not ts:
         return 0
     try:
-        target = parse_iso(iso_ts)
+        target = datetime.fromtimestamp(ts, timezone.utc) if isinstance(ts, (int, float)) else parse_iso(ts)
         return max(0, int((target - datetime.now(timezone.utc)).total_seconds()))
     except Exception:
         return 0
@@ -172,8 +176,16 @@ def extract_cwd(data):
     return data.get("cwd") or ws.get("current_dir", "") or ""
 
 
-# ---------- effort (settings.json) ----------
-def get_effort():
+# ---------- effort ----------
+def get_effort(data=None):
+    """Reasoning effort level. Prefer the live, per-session value Claude Code
+    passes on stdin (`effort.level`) — it reflects mid-session changes that the
+    global settings.json `effortLevel` wouldn't. Settings is the fallback for
+    builds that don't send the field."""
+    if isinstance(data, dict):
+        eff = data.get("effort")
+        if isinstance(eff, dict) and eff.get("level"):
+            return str(eff["level"])
     try:
         with open(CLAUDE_DIR / "settings.json") as f:
             return str(json.load(f).get("effortLevel", "-"))
@@ -408,6 +420,9 @@ def get_plan_usage():
     info = {
         "five_pct": None, "five_reset": None,
         "wk_pct": None, "wk_reset": None,
+        # Per-model weekly sub-limit. Only the OMC usage cache carries this — the
+        # statusline stdin's rate_limits exposes five_hour/seven_day only.
+        "sonnet_pct": None, "sonnet_reset": None,
         "cache_age": None,
     }
     try:
@@ -417,12 +432,46 @@ def get_plan_usage():
         info["five_reset"] = data.get("fiveHourResetsAt")
         info["wk_pct"] = data.get("weeklyPercent")
         info["wk_reset"] = data.get("weeklyResetsAt")
+        info["sonnet_pct"] = data.get("sonnetWeeklyPercent")
+        info["sonnet_reset"] = data.get("sonnetWeeklyResetsAt")
         ts_ms = cache.get("timestamp")
         if ts_ms:
             info["cache_age"] = (time.time() * 1000 - ts_ms) / 1000
     except Exception:
         pass
     return info
+
+
+def read_rate_limits(data):
+    """Live 5h/7d plan quota from Claude Code's statusline input (`rate_limits`),
+    shaped like get_plan_usage() output: pct 0-100, reset as a Unix epoch (secs).
+
+    When present this drives the 5h/7d bars in real time (preferred over the OMC
+    cache). It exposes `five_hour`/`seven_day` only — no per-model breakdown — so
+    the Sonnet bar still comes from the OMC cache. Optional (only emitted on
+    plans/builds with unified rate-limit headers); returns None when absent, and
+    the OMC cache stays the fallback for 5h/7d."""
+    rl = data.get("rate_limits")
+    if not isinstance(rl, dict):
+        return None
+
+    def window(key):
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            return (None, None)
+        pct = w.get("used_percentage")
+        try:
+            pct = float(pct) if pct is not None else None
+        except (TypeError, ValueError):
+            pct = None
+        return (pct, w.get("resets_at"))
+
+    five_pct, five_reset = window("five_hour")
+    wk_pct, wk_reset = window("seven_day")
+    if five_pct is None and wk_pct is None:
+        return None
+    return {"five_pct": five_pct, "five_reset": five_reset,
+            "wk_pct": wk_pct, "wk_reset": wk_reset}
 
 
 def refresh_usage_cache_async(input_json):
@@ -559,28 +608,13 @@ def _ccusage_plan_week(reset_iso):
     return {"plan_week_cost": total, "plan_week_reset": reset_iso}
 
 
-_CTX_RE = re.compile(r"🧠\s+([\d,]+)\s*\((\d+(?:\.\d+)?)\s*%\)")
-_CTX_PCT_RE = re.compile(r"🧠\s+(\d+(?:\.\d+)?)\s*%")
-
-
-def _ccusage_ctx(input_json):
-    raw = json.dumps(input_json)
-    out = subprocess.run(
-        ["ccusage", "statusline"],
-        input=raw, capture_output=True, text=True, timeout=10,
-    ).stdout
-    m = _CTX_RE.search(out)
-    if m:
-        return {"ctx_tokens": int(m.group(1).replace(",", "")), "ctx_pct": float(m.group(2))}
-    m = _CTX_PCT_RE.search(out)
-    if m:
-        return {"ctx_tokens": None, "ctx_pct": float(m.group(1))}
-    return {"ctx_tokens": None, "ctx_pct": None}
-
-
 # ---------- refresh worker ----------
 def refresh_local_cache(input_json):
-    """Parallel: 4 ccusage calls + transcript scan + git status. Atomic write.
+    """Parallel: 3 ccusage calls + transcript scan + git status. Atomic write.
+
+    Context is no longer fetched here — it comes live from the statusline input's
+    `context_window` field on every render (see read_context_window), which is
+    per-session, matches /context, and is correct on the 1M beta.
 
     Always releases REFRESH_LOCK on exit so the next mtime change can refresh.
     """
@@ -596,7 +630,6 @@ def refresh_local_cache(input_json):
             "blocks": _ccusage_blocks,
             "monthly": _ccusage_monthly,
             "plan_week": lambda: _ccusage_plan_week(reset_iso),
-            "ctx": lambda: _ccusage_ctx(input_json),
             "transcript": lambda: scan_transcript(transcript),
             "git": lambda: get_git_status(cwd),
         }
@@ -652,6 +685,34 @@ def refresh_local_cache_async(input_json):
 SEP = f" {DIM}·{RESET} "
 
 
+def read_context_window(data):
+    """Live, per-session context usage straight from Claude Code's statusline
+    input (the `context_window` object it passes on stdin every render).
+
+    This is exactly what `/context` shows: input-side tokens of the most recent
+    response over the model's *real* limit (200k, or 1M on the extended-context
+    beta) — so it is correct on 1M sessions and never bleeds across sessions the
+    way the shared cache does. `ccusage` can't see either fact.
+
+    Returns (tokens, pct, size); any field is None when absent or pre-first
+    response (`context_window`/`current_usage` are null until the first API call
+    and right after /compact).
+    """
+    cw = data.get("context_window")
+    if not isinstance(cw, dict):
+        return (None, None, None)
+    try:
+        tokens = int(cw["total_input_tokens"]) if cw.get("total_input_tokens") is not None else None
+    except (TypeError, ValueError):
+        tokens = None
+    try:
+        pct = float(cw["used_percentage"]) if cw.get("used_percentage") is not None else None
+    except (TypeError, ValueError):
+        pct = None
+    size = cw.get("context_window_size")
+    return (tokens, pct, size)
+
+
 def _fmt_ctx_field(ctx_tokens, ctx_pct):
     if ctx_tokens is not None and ctx_pct is not None:
         body = f"{fmt_tokens(ctx_tokens)} ({int(round(ctx_pct))}%)"
@@ -705,9 +766,18 @@ def _fmt_burn_field(burn, wk_pct, plan_week_cost):
     return burn_str
 
 
+def _fmt_bar(label, pct, reset):
+    """One quota bar line: label · gradient bar · colored % · reset countdown.
+    `label` is expected pre-padded so multiple bars align."""
+    pct = pct if pct is not None else 0.0
+    remain = seconds_until(reset)
+    return (f"{GREEN}{label}{RESET}  {render_bar(pct)}  {color_pct(pct)}  "
+            f"{DIM}({fmt_remaining(remain)}){RESET}")
+
+
 def render(data, cache, plan):
     model = data.get("model", {}).get("display_name", "Claude")
-    effort = get_effort()
+    effort = get_effort(data)
 
     # Transcript-derived (from cache)
     last_slash = cache.get("tx_last_slash", "-")
@@ -726,9 +796,24 @@ def render(data, cache, plan):
     session_dur = fmt_duration_short(time.time() - session_start) if session_start else "-"
     latency_str = fmt_duration_short(last_latency) if last_latency else "-"
 
-    # Cost / context (from cache)
-    ctx_tokens = cache.get("ctx_tokens")
-    ctx_pct = cache.get("ctx_pct")
+    # Context comes live, per-session, from Claude Code's statusline input
+    # (`context_window`): it matches /context exactly, is correct on the 1M beta,
+    # and — unlike the old shared cache — never bleeds across sessions.
+    ctx_tokens, ctx_pct, _ = read_context_window(data)
+
+    # Live per-session signals straight from the statusline input.
+    cost = data.get("cost") if isinstance(data.get("cost"), dict) else {}
+    sess_cost = cost.get("total_cost_usd")
+    sess_added = int(cost.get("total_lines_added") or 0)
+    sess_removed = int(cost.get("total_lines_removed") or 0)
+    version = data.get("version")
+    thinking = data.get("thinking") if isinstance(data.get("thinking"), dict) else {}
+    thinking_on = bool(thinking.get("enabled"))
+    out_style = data.get("output_style") if isinstance(data.get("output_style"), dict) else {}
+    style_name = out_style.get("name")
+    exceeds_200k = bool(data.get("exceeds_200k_tokens"))
+
+    # Account-wide cost (from cache / ccusage): current block, plan week, month.
     block_cost = cache.get("block_cost")
     burn = cache.get("burn")
     plan_week_cost = cache.get("plan_week_cost")
@@ -739,14 +824,22 @@ def render(data, cache, plan):
     mo_str = f"${monthly_cost:.2f}" if monthly_cost is not None else "$-"
 
     # --- Line 1: identity + state ---
-    l1_fields = [
-        f"🤖 {model}",
-        f"⚡ {effort}",
-    ]
+    model_str = f"🤖 {model}"
+    if version:
+        model_str += f" {DIM}v{version}{RESET}"
+    effort_str = f"⚡ {effort}"
+    if thinking_on:
+        effort_str += " 💭"
+    l1_fields = [model_str, effort_str]
     git_field = _fmt_git_field(cache)
     if git_field:
         l1_fields.append(git_field)
-    l1_fields.append(_fmt_ctx_field(ctx_tokens, ctx_pct))
+    # exceeds_200k_tokens is redundant with a live % (it just means >200k used),
+    # so surface it only as a coarse signal when no context_window % is available.
+    if ctx_pct is None and exceeds_200k:
+        l1_fields.append(f"🧠 {DIM}>200k{RESET}")
+    else:
+        l1_fields.append(_fmt_ctx_field(ctx_tokens, ctx_pct))
     if cache_hit is not None:
         l1_fields.append(f"📊 {int(round(cache_hit))}% cache")
     if session_start:
@@ -756,16 +849,20 @@ def render(data, cache, plan):
     line1 = SEP.join(l1_fields)
 
     # --- Line 2: cost + activity ---
-    l2_fields = [
-        f"💰 {block_str} / {wk_str} / {mo_str}",
-        _fmt_burn_field(burn, plan.get("wk_pct"), plan_week_cost),
-    ]
+    l2_fields = [f"💰 {block_str} / {wk_str} / {mo_str}"]
+    if sess_cost is not None:
+        l2_fields.append(f"💬 ${sess_cost:.2f}")  # this conversation's spend
+    l2_fields.append(_fmt_burn_field(burn, plan.get("wk_pct"), plan_week_cost))
+    if sess_added or sess_removed:
+        l2_fields.append(f"✎ +{sess_added} -{sess_removed}")  # Claude's edits this session
     if todos_total > 0:
         l2_fields.append(f"✓ {todos_pending}/{todos_total} todo")
     if tool_count > 0:
         l2_fields.append(f"🔧 {tool_count}")
     if bg_count > 0:
         l2_fields.append(f"🌐 {bg_count} bg")
+    if style_name and style_name not in ("default", "null"):
+        l2_fields.append(f"🎨 {style_name}")
     l2_fields.append(f"📝 {slash_field}")
     line2 = SEP.join(l2_fields)
 
@@ -780,14 +877,16 @@ def render(data, cache, plan):
         line3 = f"👥 {agents_running}  " + "  ".join(nodes)
 
     # --- Bars ---
-    five_pct = plan["five_pct"] if plan["five_pct"] is not None else 0.0
-    wk_pct = plan["wk_pct"] if plan["wk_pct"] is not None else 0.0
-    five_remain = seconds_until(plan["five_reset"])
-    wk_remain = seconds_until(plan["wk_reset"])
-    bars = [
-        f"{GREEN}5h{RESET}  {render_bar(five_pct)}  {color_pct(five_pct)}  {DIM}({fmt_remaining(five_remain)}){RESET}",
-        f"{GREEN}7d{RESET}  {render_bar(wk_pct)}  {color_pct(wk_pct)}  {DIM}({fmt_remaining(wk_remain)}){RESET}",
+    # 5h + 7d (overall) always; Sonnet weekly sub-limit only when the OMC usage
+    # cache provides it (stdin rate_limits has no per-model breakdown).
+    bar_specs = [
+        ("5h", plan["five_pct"], plan["five_reset"]),
+        ("7d", plan["wk_pct"], plan["wk_reset"]),
     ]
+    if plan.get("sonnet_pct") is not None:
+        bar_specs.append(("Son", plan["sonnet_pct"], plan["sonnet_reset"]))
+    pad = max(len(lbl) for lbl, _, _ in bar_specs)
+    bars = [_fmt_bar(lbl.ljust(pad), pct, reset) for lbl, pct, reset in bar_specs]
 
     lines = [line1, line2]
     if line3:
@@ -828,6 +927,11 @@ def main():
 
     cache = read_local_cache()
     plan = get_plan_usage()
+    # Prefer live 5h/7d quota straight from stdin (real-time); the OMC cache
+    # still supplies the per-model Sonnet bar, which stdin doesn't carry.
+    live_rl = read_rate_limits(data)
+    if live_rl:
+        plan = {**plan, **live_rl}
     try:
         sys.stdout.write(render(data, cache, plan) + "\n")
     except Exception:
@@ -847,7 +951,10 @@ def main():
         if (OMC_HUD.exists()
                 and (plan["cache_age"] is None or plan["cache_age"] > CACHE_STALE_SECS)
                 and try_acquire_lock(USAGE_LOCK, USAGE_LOCK_TTL)):
-            # The node HUD worker can't release our lock; it expires via TTL.
+            # Keep the OMC usage cache fresh: it's the only source of the Sonnet
+            # weekly sub-limit (stdin rate_limits has no per-model breakdown) and
+            # the 5h/7d fallback. The node HUD worker can't release our lock; it
+            # expires via TTL.
             refresh_usage_cache_async(data)
     except Exception:
         pass
