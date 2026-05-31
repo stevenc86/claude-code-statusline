@@ -97,6 +97,12 @@ class TimeParsingTests(unittest.TestCase):
         self.assertEqual(sl.seconds_until("garbage"), 0)
         self.assertEqual(sl.seconds_until("2000-01-01T00:00:00Z"), 0)  # past clamps to 0
 
+    def test_seconds_until_accepts_epoch_seconds(self):
+        # stdin rate_limits.resets_at is a Unix epoch in seconds.
+        self.assertEqual(sl.seconds_until(0), 0)            # epoch past clamps to 0
+        future = time.time() + 3600
+        self.assertGreater(sl.seconds_until(future), 3500)
+
 
 class ExtractCwdTests(unittest.TestCase):
     def test_workspace_none_does_not_crash(self):
@@ -260,6 +266,154 @@ class RenderTests(unittest.TestCase):
     def test_agent_line_omitted_when_idle(self):
         out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
         self.assertNotIn("👥", out)
+
+    def test_live_context_window_preferred_over_cache(self):
+        # Live `context_window` from stdin wins over the (possibly cross-session)
+        # cached ccusage value — and stays correct on the 1M beta.
+        data = {
+            "model": {"display_name": "X"},
+            "context_window": {
+                "total_input_tokens": 82215, "total_output_tokens": 743,
+                "context_window_size": 1000000, "used_percentage": 8,
+                "remaining_percentage": 92,
+            },
+        }
+        cache = {"ctx_tokens": 109596, "ctx_pct": 42.0}  # stale / other session
+        out = sl.render(data, cache, self._plan())
+        self.assertIn("🧠 82k (8%)", out)
+        self.assertNotIn("42%", out)
+
+    def test_live_session_fields_and_flags_render(self):
+        data = {
+            "model": {"display_name": "Claude Opus 4.8"},
+            "version": "2.1.158",
+            "effort": {"level": "high"},
+            "thinking": {"enabled": True},
+            "output_style": {"name": "Explanatory"},
+            "cost": {"total_cost_usd": 2.86, "total_lines_added": 42,
+                     "total_lines_removed": 7},
+        }
+        out = sl.render(data, {}, self._plan())
+        self.assertIn("v2.1.158", out)     # version after model
+        self.assertIn("⚡ high", out)
+        self.assertIn("💭", out)            # thinking indicator
+        self.assertIn("💬 $2.86", out)      # session cost
+        self.assertIn("✎ +42 -7", out)     # session edits
+        self.assertIn("🎨 Explanatory", out)
+
+    def test_default_output_style_hidden(self):
+        data = {"model": {"display_name": "X"}, "output_style": {"name": "default"}}
+        self.assertNotIn("🎨", sl.render(data, {}, self._plan()))
+
+    def test_live_rate_limits_drive_bars(self):
+        # plan (from OMC cache) is empty; stdin rate_limits should fill the bars.
+        plan = {"five_pct": 26.0, "wk_pct": 4.0, "five_reset": None,
+                "wk_reset": None, "cache_age": 1}
+        out = sl.render({"model": {"display_name": "X"}}, {}, plan)
+        self.assertIn("5h", out)
+        self.assertIn("7d", out)
+
+    def test_sonnet_bar_shown_when_present(self):
+        plan = {**self._plan(), "sonnet_pct": 10.0, "sonnet_reset": None}
+        out = sl.render({"model": {"display_name": "X"}}, {}, plan)
+        self.assertIn("Son", out)
+        self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + 3 bars
+
+    def test_sonnet_bar_omitted_when_absent(self):
+        out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
+        self.assertNotIn("Son", out)
+        self.assertEqual(out.count("\n") + 1, 4)  # 2 status lines + 2 bars
+
+    def test_no_context_window_shows_placeholder_not_stale_cache(self):
+        # Context is live-only now. A stale cache value must NOT leak in (that was
+        # the cross-session bleed bug); absent context_window renders "🧠 -".
+        cache = {"ctx_tokens": 290000, "ctx_pct": 29.0}
+        out = sl.render({"model": {"display_name": "X"}}, cache, self._plan())
+        self.assertIn("🧠 -", out)
+        self.assertNotIn("290k", out)
+        self.assertNotIn("29%", out)
+
+
+class ReadContextWindowTests(unittest.TestCase):
+    def test_missing_field_returns_none(self):
+        self.assertEqual(sl.read_context_window({}), (None, None, None))
+
+    def test_full_object_parsed(self):
+        cw = {"context_window": {"total_input_tokens": 82215,
+                                 "used_percentage": 8, "context_window_size": 1000000}}
+        self.assertEqual(sl.read_context_window(cw), (82215, 8.0, 1000000))
+
+    def test_null_usage_after_compact_is_safe(self):
+        # current_usage/totals are null right after /compact or before first call.
+        cw = {"context_window": {"total_input_tokens": None,
+                                 "used_percentage": None, "context_window_size": 200000}}
+        self.assertEqual(sl.read_context_window(cw), (None, None, 200000))
+
+    def test_non_dict_does_not_crash(self):
+        self.assertEqual(sl.read_context_window({"context_window": "nope"}), (None, None, None))
+
+
+class EffortTests(unittest.TestCase):
+    def test_stdin_effort_level_preferred(self):
+        self.assertEqual(sl.get_effort({"effort": {"level": "xhigh"}}), "xhigh")
+
+    def test_falls_back_to_settings_when_absent(self):
+        # No `effort` on stdin -> read settings.json (scratch dir has none -> "-").
+        self.assertEqual(sl.get_effort({}), "-")
+        self.assertEqual(sl.get_effort(None), "-")
+
+    def test_malformed_effort_does_not_crash(self):
+        self.assertEqual(sl.get_effort({"effort": "nope"}), "-")
+
+
+class RateLimitsTests(unittest.TestCase):
+    def test_reads_both_windows(self):
+        data = {"rate_limits": {
+            "five_hour": {"used_percentage": 26.0, "resets_at": 1780000000},
+            "seven_day": {"used_percentage": 4.0, "resets_at": 1780500000},
+        }}
+        rl = sl.read_rate_limits(data)
+        self.assertEqual(rl["five_pct"], 26.0)
+        self.assertEqual(rl["five_reset"], 1780000000)
+        self.assertEqual(rl["wk_pct"], 4.0)
+        self.assertEqual(rl["wk_reset"], 1780500000)
+
+    def test_absent_returns_none(self):
+        self.assertIsNone(sl.read_rate_limits({}))
+        self.assertIsNone(sl.read_rate_limits({"rate_limits": "nope"}))
+        self.assertIsNone(sl.read_rate_limits({"rate_limits": {}}))
+
+    def test_partial_window_ok(self):
+        rl = sl.read_rate_limits({"rate_limits": {"five_hour": {"used_percentage": 50}}})
+        self.assertEqual(rl["five_pct"], 50.0)
+        self.assertIsNone(rl["wk_pct"])
+
+
+class PlanUsageTests(unittest.TestCase):
+    def setUp(self):
+        sl.USAGE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        try:
+            sl.USAGE_CACHE.unlink()
+        except FileNotFoundError:
+            pass
+
+    def test_reads_sonnet_weekly_from_omc_cache(self):
+        sl.USAGE_CACHE.write_text(json.dumps({
+            "timestamp": int(time.time() * 1000),
+            "data": {"fiveHourPercent": 7, "weeklyPercent": 59,
+                     "sonnetWeeklyPercent": 10,
+                     "sonnetWeeklyResetsAt": "2026-06-02T10:00:00Z"},
+        }))
+        info = sl.get_plan_usage()
+        self.assertEqual(info["wk_pct"], 59)
+        self.assertEqual(info["sonnet_pct"], 10)
+        self.assertEqual(info["sonnet_reset"], "2026-06-02T10:00:00Z")
+
+    def test_missing_sonnet_is_none(self):
+        sl.USAGE_CACHE.write_text(json.dumps({"data": {"weeklyPercent": 59}}))
+        self.assertIsNone(sl.get_plan_usage()["sonnet_pct"])
 
 
 class NeedsRefreshTests(unittest.TestCase):

@@ -46,7 +46,7 @@ This is the core design and the thing to understand before changing anything. Th
 
 1. **Render mode** (default, runs on every Claude Code redraw, ~20 ms): reads three JSON files — the local cache, the OMC plan-usage cache, and `settings.json` — and prints. It does **no** subprocess calls, no transcript scan, no git. All it does beyond reading caches is *decide whether a refresh is due* and, if so, fire-and-forget a detached worker. The render must stay cheap; expensive imports (`concurrent.futures`, `tempfile`, `timedelta`) are deliberately kept out of the top-level import block and imported lazily inside the refresh path only.
 
-2. **Refresh mode** (`--refresh`, detached subprocess, 5–10 s): the script re-invokes *itself* via `refresh_local_cache_async`. The worker runs 4 `ccusage` calls + a transcript scan + `git status` **in parallel** (`ThreadPoolExecutor`), merges them, and atomically writes the local cache. The render path picks up the new values on the next redraw.
+2. **Refresh mode** (`--refresh`, detached subprocess, 5–10 s): the script re-invokes *itself* via `refresh_local_cache_async`. The worker runs 3 `ccusage` calls (cost/burn only) + a transcript scan + `git status` **in parallel** (`ThreadPoolExecutor`), merges them, and atomically writes the local cache. The render path picks up the new values on the next redraw. Context is *not* refreshed here — it comes live from the statusline input's `context_window` field on every render (see `read_context_window`), so it's per-session, matches `/context`, and is correct on the 1M beta. Effort likewise prefers the live `effort.level` from stdin.
 
 So the slow work never blocks the visible statusline — it always shows the last cached values and refreshes behind the scenes.
 
@@ -55,9 +55,11 @@ So the slow work never blocks the visible statusline — it always shows the las
 | File | Owner | Contents |
 |------|-------|----------|
 | `.statusline-cache.json` | this script's refresh worker | cost/burn/context/git/transcript-derived fields |
-| `plugins/oh-my-claudecode/.usage-cache-anthropic.json` | OMC HUD (external `node` script) | 5h / 7d plan-quota %. Refreshed by spawning `hud/omc-hud.mjs`. Optional — bars show 0% without it. |
+| `plugins/oh-my-claudecode/.usage-cache-anthropic.json` | OMC HUD (external `node` script) | 5h / 7d / **Sonnet-weekly** plan-quota % + resets. `render()` prefers the live stdin `rate_limits` for the 5h/7d *display* (real-time), but this cache is the **only** source of the per-model Sonnet sub-limit (`sonnetWeeklyPercent`) — stdin exposes `five_hour`/`seven_day` only — and the 5h/7d fallback. So the HUD is still spawned (staleness-gated) whenever it's installed. Refreshed by spawning `hud/omc-hud.mjs`. Optional — without it the Sonnet bar is hidden and 5h/7d fall back to 0% when stdin lacks them. |
 
 In the cache, transcript-scan fields are namespaced `tx_*` and git fields `git_*` (see `refresh_local_cache`); other ccusage fields are top-level. `render()` reads these keys directly, so renaming a producer key means updating the reader too.
+
+Several fields are read **live from the statusline stdin** rather than any cache — they're per-session, real-time, and can't bleed across sessions: `context_window` → `read_context_window` (ctx tokens/%, /context-accurate, 1M-correct), `rate_limits` → `read_rate_limits` (5h/7d bars), `effort.level` → `get_effort`, and `cost`/`version`/`thinking`/`output_style`/`exceeds_200k_tokens` read directly in `render()`. Prefer stdin over ccusage/OMC/settings whenever Claude Code provides the number.
 
 ### Single-flight refresh locking
 
