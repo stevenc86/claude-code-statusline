@@ -30,7 +30,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -39,12 +39,12 @@ RESET = "\033[0m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RED = "\033[38;2;255;100;100m"
-GREEN = "\033[38;2;152;216;170m"
+GREEN = "\033[38;2;190;227;176m"
 
-# Vivid Macaron palette
-GREEN_RGB = (152, 216, 170)  # pistachio #98D8AA
-AMBER_RGB = (255, 217, 162)  # mango #FFD9A2
-RED_RGB = (255, 158, 178)    # raspberry #FF9EB2
+# Spring Garden macaron palette (gradient anchors: low→mid→high)
+GREEN_RGB = (190, 227, 176)  # matcha #BEE3B0
+AMBER_RGB = (251, 229, 166)  # lemon #FBE5A6
+RED_RGB = (248, 180, 200)    # blossom #F8B4C8
 
 # Warning thresholds
 CTX_WARN_PCT = 80
@@ -85,6 +85,17 @@ def rgb_at(pct):
 
 def ansi(r, g, b):
     return f"\033[38;2;{r};{g};{b}m"
+
+
+# Macaron text accents (Spring Garden family) — color status fields by meaning.
+# Adjacent fields use different hues so a line reads with rhythm, not blur.
+MATCHA = ansi(190, 227, 176)   # green  — identity / additions / done
+MINT = ansi(153, 230, 201)     # teal   — "higher is better" gauges (cache)
+LEMON = ansi(251, 229, 166)    # yellow — money / cost / pending
+PEACH = ansi(255, 199, 154)    # orange — heat / energy (effort, burn)
+BLOSSOM = ansi(248, 180, 200)  # pink   — creative / warm (style)
+LAVENDER = ansi(201, 182, 228) # purple — system / meta / time
+SKY = ansi(167, 211, 240)      # blue   — navigation / info counts
 
 
 def render_bar(pct, width=BAR_WIDTH):
@@ -722,7 +733,9 @@ def _fmt_ctx_field(ctx_tokens, ctx_pct):
         return "🧠 -"
     if ctx_pct is not None and ctx_pct >= CTX_WARN_PCT:
         return f"{RED}⚠ 🧠 {body}{RESET}"
-    return f"🧠 {body}"
+    if ctx_pct is None:
+        return f"🧠 {body}"
+    return f"{ansi(*rgb_at(ctx_pct))}🧠 {body}{RESET}"
 
 
 def _fmt_git_field(cache):
@@ -745,8 +758,8 @@ def _fmt_git_field(cache):
 
 def _fmt_burn_field(burn, wk_pct, plan_week_cost):
     if burn is None:
-        return "🔥 $-/h"
-    burn_str = f"🔥 ${burn:.2f}/h"
+        return f"{PEACH}🔥 $-/h{RESET}"
+    burn_str = f"{PEACH}🔥 ${burn:.2f}/h{RESET}"
     # Burn-rate projection: how many hours until weekly quota is full
     if (
         wk_pct is not None and burn and burn > 0
@@ -824,16 +837,16 @@ def render(data, cache, plan):
     mo_str = f"${monthly_cost:.2f}" if monthly_cost is not None else "$-"
 
     # --- Line 1: identity + state ---
-    model_str = f"🤖 {model}"
+    model_str = f"{MATCHA}🤖 {model}{RESET}"
     if version:
         model_str += f" {DIM}v{version}{RESET}"
-    effort_str = f"⚡ {effort}"
+    effort_str = f"{PEACH}⚡ {effort}{RESET}"
     if thinking_on:
         effort_str += " 💭"
     l1_fields = [model_str, effort_str]
     git_field = _fmt_git_field(cache)
     if git_field:
-        l1_fields.append(git_field)
+        l1_fields.append(f"{SKY}{git_field}{RESET}")
     # exceeds_200k_tokens is redundant with a live % (it just means >200k used),
     # so surface it only as a coarse signal when no context_window % is available.
     if ctx_pct is None and exceeds_200k:
@@ -841,29 +854,30 @@ def render(data, cache, plan):
     else:
         l1_fields.append(_fmt_ctx_field(ctx_tokens, ctx_pct))
     if cache_hit is not None:
-        l1_fields.append(f"📊 {int(round(cache_hit))}% cache")
+        l1_fields.append(f"{MINT}📊 {int(round(cache_hit))}% cache{RESET}")
     if session_start:
-        l1_fields.append(f"⏱ {session_dur}")
+        l1_fields.append(f"{LAVENDER}⏱ {session_dur}{RESET}")
     if last_latency:
-        l1_fields.append(f"⌛ {latency_str}")
+        l1_fields.append(f"{LAVENDER}⌛ {latency_str}{RESET}")
     line1 = SEP.join(l1_fields)
 
     # --- Line 2: cost + activity ---
-    l2_fields = [f"💰 {block_str} / {wk_str} / {mo_str}"]
+    l2_fields = [f"{LEMON}💰 {block_str} / {wk_str} / {mo_str}{RESET}"]
     if sess_cost is not None:
-        l2_fields.append(f"💬 ${sess_cost:.2f}")  # this conversation's spend
+        l2_fields.append(f"{LEMON}💬 ${sess_cost:.2f}{RESET}")  # this conversation's spend
     l2_fields.append(_fmt_burn_field(burn, plan.get("wk_pct"), plan_week_cost))
     if sess_added or sess_removed:
-        l2_fields.append(f"✎ +{sess_added} -{sess_removed}")  # Claude's edits this session
+        l2_fields.append(f"{MATCHA}✎ +{sess_added} -{sess_removed}{RESET}")  # Claude's edits this session
     if todos_total > 0:
-        l2_fields.append(f"✓ {todos_pending}/{todos_total} todo")
+        todo_clr = MATCHA if todos_pending == 0 else LEMON
+        l2_fields.append(f"{todo_clr}✓ {todos_pending}/{todos_total} todo{RESET}")
     if tool_count > 0:
-        l2_fields.append(f"🔧 {tool_count}")
+        l2_fields.append(f"{SKY}🔧 {tool_count}{RESET}")
     if bg_count > 0:
-        l2_fields.append(f"🌐 {bg_count} bg")
+        l2_fields.append(f"{LAVENDER}🌐 {bg_count} bg{RESET}")
     if style_name and style_name not in ("default", "null"):
-        l2_fields.append(f"🎨 {style_name}")
-    l2_fields.append(f"📝 {slash_field}")
+        l2_fields.append(f"{BLOSSOM}🎨 {style_name}{RESET}")
+    l2_fields.append(f"{LAVENDER}📝 {slash_field}{RESET}")
     line2 = SEP.join(l2_fields)
 
     # --- Optional Line 3: agent tree ---
@@ -873,8 +887,8 @@ def render(data, cache, plan):
         for i, a in enumerate(agent_details):
             char = TREE_LAST if i == len(agent_details) - 1 else TREE_BRANCH
             dur = fmt_duration_short(time.time() - a.get("start_unix", time.time()))
-            nodes.append(f"{char} {a.get('name', 'agent')} {DIM}{dur}{RESET}")
-        line3 = f"👥 {agents_running}  " + "  ".join(nodes)
+            nodes.append(f"{SKY}{char} {a.get('name', 'agent')}{RESET} {DIM}{dur}{RESET}")
+        line3 = f"{LAVENDER}👥 {agents_running}{RESET}  " + "  ".join(nodes)
 
     # --- Bars ---
     # 5h + 7d (overall) always; Sonnet weekly sub-limit only when the OMC usage
