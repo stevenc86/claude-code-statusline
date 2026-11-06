@@ -662,6 +662,108 @@ class PlanUsageTests(unittest.TestCase):
         self.assertEqual(sl.get_plan_usage()["scoped"], [])
 
 
+class PerSessionCacheTests(unittest.TestCase):
+    """Local cache: account-wide ccusage fields shared, tx_*/git_* per session."""
+
+    def setUp(self):
+        self._orig = {n: getattr(sl, n) for n in
+                      ("_ccusage_blocks", "_ccusage_monthly", "_ccusage_plan_week")}
+        sl._ccusage_blocks = lambda: {"block_cost": 3.0, "burn": 1.5}
+        sl._ccusage_monthly = lambda: {"monthly_cost": 30.0}
+        sl._ccusage_plan_week = lambda reset: {"plan_week_cost": 9.0, "plan_week_reset": reset}
+
+    def tearDown(self):
+        for n, fn in self._orig.items():
+            setattr(sl, n, fn)
+        for p in (sl.LOCAL_CACHE, sl.REFRESH_LOCK):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _transcript(self, n_tools):
+        fd, path = tempfile.mkstemp(suffix=".jsonl", dir=_SCRATCH)
+        content = [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {}}
+                   for i in range(n_tools)]
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-11-06T00:00:00Z",
+                                "message": {"role": "assistant", "content": content}}) + "\n")
+        return path
+
+    def test_session_key_fallbacks(self):
+        self.assertEqual(sl.session_key({"session_id": "abc", "transcript_path": "/t"}), "abc")
+        self.assertEqual(sl.session_key({"transcript_path": "/t"}), "/t")
+        self.assertEqual(sl.session_key({}), "_default")
+        self.assertEqual(sl.session_key(None), "_default")
+
+    def test_view_merges_account_fields_with_own_session_only(self):
+        cache = {"block_cost": 3.0, "monthly_cost": 30.0,
+                 "sessions": {"A": {"tx_tool_count": 5}, "B": {"tx_tool_count": 77}}}
+        view = sl.session_view(cache, {"session_id": "A"})
+        self.assertEqual(view, {"block_cost": 3.0, "monthly_cost": 30.0, "tx_tool_count": 5})
+
+    def test_legacy_flat_cache_leaks_no_transcript_fields(self):
+        legacy = {"block_cost": 3.0, "tx_tool_count": 985, "ctx_pct": 8.0,
+                  "timestamp": time.time(), "transcript_mtime": 1.0}
+        view = sl.session_view(legacy, {"session_id": "A"})
+        self.assertEqual(view, {"block_cost": 3.0})
+        self.assertTrue(sl.needs_refresh({"session_id": "A"}, view, {}))
+
+    def test_other_sessions_refresh_does_not_make_this_one_stale(self):
+        now = time.time()
+        cache = {"sessions": {
+            "A": {"timestamp": now, "transcript_mtime": None, "git_index_mtime": None},
+            "B": {"timestamp": now - 3600}}}
+        a = {"session_id": "A", "transcript_path": ""}
+        self.assertFalse(sl.needs_refresh(a, sl.session_view(cache, a), {}))
+        self.assertTrue(sl.needs_refresh({"session_id": "C"},
+                                         sl.session_view(cache, {"session_id": "C"}), {}))
+
+    def test_refresh_writes_own_session_and_keeps_others(self):
+        now = time.time()
+        sl.write_local_cache_atomic({
+            "block_cost": 1.0, "tx_tool_count": 985, "ctx_pct": 8.0,   # legacy flat keys
+            "sessions": {
+                "A": {"tx_tool_count": 5, "timestamp": now - 10},
+                "stale": {"tx_tool_count": 1, "timestamp": now - sl.SESSION_CACHE_TTL - 60},
+            }})
+        sl.try_acquire_lock(sl.REFRESH_LOCK, sl.REFRESH_LOCK_TTL)
+        sl.refresh_local_cache({"session_id": "B", "transcript_path": self._transcript(2),
+                                "cwd": ""})
+        out = sl.read_local_cache()
+        self.assertEqual(set(out["sessions"]), {"A", "B"})        # stale pruned
+        self.assertEqual(out["sessions"]["A"]["tx_tool_count"], 5)  # untouched
+        self.assertEqual(out["sessions"]["B"]["tx_tool_count"], 2)
+        self.assertEqual(out["block_cost"], 3.0)                    # account-wide, refreshed
+        self.assertEqual(out["monthly_cost"], 30.0)
+        self.assertNotIn("tx_tool_count", out)                      # legacy keys dropped
+        self.assertNotIn("ctx_pct", out)
+        self.assertFalse(sl.REFRESH_LOCK.exists())                  # lock released
+
+    def test_failed_task_keeps_previous_session_values(self):
+        now = time.time()
+        sl.write_local_cache_atomic({"sessions": {"A": {"tx_tool_count": 5,
+                                                        "timestamp": now - 10}}})
+        orig_scan = sl.scan_transcript
+        sl.scan_transcript = lambda path: 1 / 0
+        try:
+            sl.refresh_local_cache({"session_id": "A", "transcript_path": "", "cwd": ""})
+        finally:
+            sl.scan_transcript = orig_scan
+        entry = sl.read_local_cache()["sessions"]["A"]
+        self.assertEqual(entry["tx_tool_count"], 5)
+        self.assertGreater(entry["timestamp"], now - 10)
+
+    def test_prune_caps_session_count(self):
+        now = time.time()
+        sessions = {f"s{i}": {"timestamp": now - i} for i in range(sl.SESSION_CACHE_MAX + 5)}
+        sessions["junk"] = "not a dict"
+        kept = sl._prune_sessions(sessions, now)
+        self.assertEqual(len(kept), sl.SESSION_CACHE_MAX)
+        self.assertIn("s0", kept)                                   # newest kept
+        self.assertNotIn(f"s{sl.SESSION_CACHE_MAX + 4}", kept)      # oldest dropped
+
+
 class NeedsRefreshTests(unittest.TestCase):
     def test_no_cache_timestamp_forces_refresh(self):
         self.assertTrue(sl.needs_refresh({}, {}, {}))

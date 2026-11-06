@@ -11,8 +11,8 @@ Layout (lines printed top → bottom):
     L6+ Fable ██        ##%  (per-model weekly sub-limits, only when OMC reports them)
 
 Performance:
-- Rendering reads three JSON files (the cost/ctx cache, the plan-usage cache,
-  and settings.json) and is ~20 ms warm. Both caches are refreshed by detached
+- Rendering reads three JSON files (the local cost/transcript cache — keyed per
+  session — the plan-usage cache, and settings.json) and is ~20 ms warm. Both caches are refreshed by detached
   subprocesses, so the render path never blocks.
 - The transcript and git index are re-scanned only when their mtime changes.
 - Refreshes are single-flight: spawning a refresh worker is gated by an on-disk
@@ -71,6 +71,11 @@ SCOPED_LABEL_MAX = 6  # per-model quota bar labels ("Fable") are truncated to th
 # worker is never pre-empted; USAGE only debounces the node HUD spawn.
 REFRESH_LOCK_TTL = 45
 USAGE_LOCK_TTL = 15
+# Local cache layout: account-wide ccusage fields at the top level (shared by all
+# sessions); transcript / git fields per session under "sessions".
+ACCOUNT_KEYS = ("block_cost", "burn", "monthly_cost", "plan_week_cost", "plan_week_reset")
+SESSION_CACHE_TTL = 24 * 60 * 60  # drop a session's entry after a day without refresh
+SESSION_CACHE_MAX = 30            # and keep at most this many session entries
 
 # Tree characters for agent display
 TREE_BRANCH = "├"
@@ -600,6 +605,46 @@ def read_local_cache():
         return {}
 
 
+def session_key(data):
+    """This session's slot in the local cache: the stdin `session_id`, falling
+    back to the transcript path, then a shared slot if both are absent."""
+    if not isinstance(data, dict):
+        return "_default"
+    return str(data.get("session_id") or data.get("transcript_path") or "_default")
+
+
+def session_view(cache, data):
+    """Flatten the shared local cache for one session.
+
+    The cache holds account-wide ccusage fields at the top level and every
+    session's transcript / git fields under `sessions[<session_key>]`, so
+    concurrent sessions no longer overwrite each other's tx_* numbers (and no
+    longer thrash refreshes by fighting over one transcript_mtime). A legacy
+    flat cache (pre-1.6) yields only its account fields, so another session's
+    transcript data can't leak in; the next refresh rewrites it."""
+    if not isinstance(cache, dict):
+        return {}
+    view = {k: cache[k] for k in ACCOUNT_KEYS if k in cache}
+    sessions = cache.get("sessions")
+    entry = sessions.get(session_key(data)) if isinstance(sessions, dict) else None
+    if isinstance(entry, dict):
+        view.update(entry)
+    return view
+
+
+def _prune_sessions(sessions, now):
+    """Drop session entries idle longer than SESSION_CACHE_TTL, then keep only
+    the SESSION_CACHE_MAX most recently refreshed."""
+    live = {k: v for k, v in sessions.items()
+            if isinstance(v, dict)
+            and isinstance(v.get("timestamp"), (int, float))
+            and now - v["timestamp"] <= SESSION_CACHE_TTL}
+    if len(live) > SESSION_CACHE_MAX:
+        newest = sorted(live, key=lambda k: live[k]["timestamp"], reverse=True)
+        live = {k: live[k] for k in newest[:SESSION_CACHE_MAX]}
+    return live
+
+
 def write_local_cache_atomic(data):
     import tempfile
     LOCAL_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -714,6 +759,11 @@ def _ccusage_plan_week(reset_iso):
 def refresh_local_cache(input_json):
     """Parallel: 3 ccusage calls + transcript scan + git status. Atomic write.
 
+    ccusage results are account-wide and go to the top level of the cache; the
+    transcript / git results belong to the session that spawned this worker and
+    go under `sessions[session_key(input_json)]` (see session_view). Other
+    sessions' entries are kept, minus any pruned as idle.
+
     Context is no longer fetched here — it comes live from the statusline input's
     `context_window` field on every render (see read_context_window), which is
     per-session, matches /context, and is correct on the 1M beta.
@@ -736,7 +786,7 @@ def refresh_local_cache(input_json):
             "git": lambda: get_git_status(cwd),
         }
 
-        merged = {}
+        account, session_fields = {}, {}
         with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
             futs = {ex.submit(fn): name for name, fn in tasks.items()}
             for fut in as_completed(futs):
@@ -748,18 +798,32 @@ def refresh_local_cache(input_json):
                 if tag == "transcript":
                     # Namespace transcript fields under tx_ for cache clarity
                     for k, v in res.items():
-                        merged[f"tx_{k}"] = v
+                        session_fields[f"tx_{k}"] = v
                 elif tag == "git":
                     for k, v in res.items():
-                        merged[f"git_{k}"] = v
+                        session_fields[f"git_{k}"] = v
                 else:
-                    merged.update(res)
+                    account.update(res)
 
-        output = dict(prev)
-        output.update(merged)
-        output["timestamp"] = time.time()
-        output["transcript_mtime"] = transcript_mtime(transcript)
-        output["git_index_mtime"] = git_index_mtime(cwd) if cwd else None
+        now = time.time()
+        prev_sessions = prev.get("sessions") if isinstance(prev.get("sessions"), dict) else {}
+        key = session_key(input_json)
+        prev_entry = prev_sessions.get(key)
+        # Start from this session's last entry so a task that failed this round
+        # keeps its previous values instead of blanking the field.
+        entry = dict(prev_entry) if isinstance(prev_entry, dict) else {}
+        entry.update(session_fields)
+        entry["timestamp"] = now
+        entry["transcript_mtime"] = transcript_mtime(transcript)
+        entry["git_index_mtime"] = git_index_mtime(cwd) if cwd else None
+        sessions = _prune_sessions(prev_sessions, now)
+        sessions[key] = entry
+
+        # Rebuilt from scratch (not dict(prev)) so legacy flat tx_*/git_*/ctx_*
+        # keys from pre-1.6 caches don't linger forever.
+        output = {k: prev[k] for k in ACCOUNT_KEYS if k in prev}
+        output.update(account)
+        output["sessions"] = sessions
         write_local_cache_atomic(output)
     except Exception:
         pass
@@ -1118,6 +1182,9 @@ def render(data, cache, plan):
 
 
 def needs_refresh(data, cache, plan):
+    # `cache` is this session's flattened view (session_view), so the timestamp
+    # and mtimes compared here are this session's own — another session's
+    # refresh no longer makes this one look stale.
     # Time-based
     cache_ts = cache.get("timestamp")
     if cache_ts is None or (time.time() - cache_ts) > CACHE_STALE_SECS:
@@ -1147,7 +1214,7 @@ def main():
         refresh_local_cache(data)
         return 0
 
-    cache = read_local_cache()
+    cache = session_view(read_local_cache(), data)
     plan = get_plan_usage()
     # Prefer live 5h/7d quota straight from stdin (real-time); the OMC cache
     # still supplies the per-model bars (Fable, Sonnet…), which stdin doesn't carry.

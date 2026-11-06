@@ -35,7 +35,7 @@ Fable  ███████████████                 49%  (4d08h
 
 **Performance:**
 - ~20 ms render. All expensive work (3 ccusage calls + transcript scan + git status) runs in parallel in a detached, single-flight refresh worker; the main path never blocks.
-- Incremental refresh: re-scans transcript / git only when their mtime changes.
+- Incremental refresh: re-scans transcript / git only when their mtime changes — compared per session, so one busy session doesn't make the others refresh.
 
 **Other:**
 - Pure Python — no Node.js runtime, no compiled binary
@@ -125,7 +125,7 @@ Refresh triggers (any of):
 Refreshes are **single-flight**: spawning a refresh worker is gated by an on-disk lock (`~/.claude/.statusline-refresh.lock`), so an actively streaming session—where the transcript mtime changes constantly—never piles up redundant refresh subprocesses. At most one refresh runs at a time; an abandoned lock is reclaimed after 45 s.
 
 Caches:
-- `~/.claude/.statusline-cache.json` — cost / burn / git / transcript-derived fields (this script maintains). Context and plan quota are **not** cached here — they're read live from the statusline input on every render.
+- `~/.claude/.statusline-cache.json` — cost / burn / git / transcript-derived fields (this script maintains). Account-wide ccusage costs sit at the top level; git and transcript-derived fields are stored **per session** under `sessions.<session_id>`, so several concurrent Claude Code sessions each show their own tool count, agents, and latency instead of overwriting one another. Session entries idle for 24 h are pruned (at most 30 kept). Context and plan quota are **not** cached here — they're read live from the statusline input on every render.
 - `~/.claude/plugins/oh-my-claudecode/.usage-cache-anthropic.json` — 5h / 7d / per-model weekly plan quota (OMC HUD maintains, 60 s TTL). The 5h/7d *display* prefers the real-time stdin `rate_limits`, but this cache is the only source of the per-model bars (**Fable**, Sonnet, Opus) and the 5h/7d fallback, so the HUD still refreshes when installed.
 
 ## Requirements
