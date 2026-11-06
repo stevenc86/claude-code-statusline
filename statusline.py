@@ -30,7 +30,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -788,6 +788,24 @@ def _fmt_bar(label, pct, reset):
             f"{DIM}({fmt_remaining(remain)}){RESET}")
 
 
+def _fmt_divider(width):
+    """A rule between the status text and the quota bars. The text fields and the
+    bar labels share the macaron greens, so the eye reads the left edge as one
+    block; this rule caps the text and marks where the bars begin.
+
+    It carries the same green→amber→pink gradient as the bars (rgb_at by column),
+    so it reads as the bars' header, with a small ◆ centered as a focal point.
+    Width spans the label + bar track so it sits directly over the bars."""
+    width = max(0, width)
+    cells = [f"{ansi(*rgb_at((i / max(width - 1, 1)) * 100))}─" for i in range(width)]
+    if width >= 3:
+        mid = width // 2
+        cells[mid] = f"{ansi(*rgb_at(50))}◆"
+        cells[mid - 1] = " "  # breathing room around the focal point
+        cells[mid + 1] = " "
+    return "".join(cells) + RESET
+
+
 def render(data, cache, plan):
     model = data.get("model", {}).get("display_name", "Claude")
     effort = get_effort(data)
@@ -905,6 +923,7 @@ def render(data, cache, plan):
     lines = [line1, line2]
     if line3:
         lines.append(line3)
+    lines.append(_fmt_divider(pad + 2 + BAR_WIDTH))
     lines.extend(bars)
     return "\n".join(lines)
 

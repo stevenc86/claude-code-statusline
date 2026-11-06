@@ -317,12 +317,22 @@ class RenderTests(unittest.TestCase):
         plan = {**self._plan(), "sonnet_pct": 10.0, "sonnet_reset": None}
         out = sl.render({"model": {"display_name": "X"}}, {}, plan)
         self.assertIn("Son", out)
-        self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + 3 bars
+        self.assertEqual(out.count("\n") + 1, 6)  # 2 status lines + divider + 3 bars
 
     def test_sonnet_bar_omitted_when_absent(self):
         out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
         self.assertNotIn("Son", out)
-        self.assertEqual(out.count("\n") + 1, 4)  # 2 status lines + 2 bars
+        self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + divider + 2 bars
+
+    def test_divider_separates_text_from_bars(self):
+        out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
+        rows = out.split("\n")
+        divider_idx = next(i for i, r in enumerate(rows) if "─" in r)
+        first_bar_idx = next(i for i, r in enumerate(rows) if "5h" in r)
+        # The rule sits between the status text and the first bar.
+        self.assertLess(divider_idx, first_bar_idx)
+        self.assertNotIn("5h", rows[divider_idx])
+        self.assertIn("◆", rows[divider_idx])  # centered ornament
 
     def test_no_context_window_shows_placeholder_not_stale_cache(self):
         # Context is live-only now. A stale cache value must NOT leak in (that was
