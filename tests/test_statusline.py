@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -762,6 +763,41 @@ class PerSessionCacheTests(unittest.TestCase):
         self.assertEqual(len(kept), sl.SESSION_CACHE_MAX)
         self.assertIn("s0", kept)                                   # newest kept
         self.assertNotIn(f"s{sl.SESSION_CACHE_MAX + 4}", kept)      # oldest dropped
+
+
+class MainTests(unittest.TestCase):
+    """End-to-end main(): stdin in, statusline out, never a traceback."""
+
+    def setUp(self):
+        import io
+        self._io = io
+        self._saved = (sys.stdin, sys.stdout, sys.argv,
+                       sl.refresh_local_cache_async, sl.refresh_usage_cache_async)
+        sl.refresh_local_cache_async = lambda data: False   # never spawn workers
+        sl.refresh_usage_cache_async = lambda data: None
+        sys.argv = ["statusline.py"]
+
+    def tearDown(self):
+        (sys.stdin, sys.stdout, sys.argv,
+         sl.refresh_local_cache_async, sl.refresh_usage_cache_async) = self._saved
+        sl.release_lock(sl.REFRESH_LOCK)
+
+    def _main(self, stdin_text):
+        sys.stdin = self._io.StringIO(stdin_text)
+        sys.stdout = out = self._io.StringIO()
+        self.assertEqual(sl.main(), 0)
+        return out.getvalue()
+
+    def test_non_object_json_stdin_does_not_crash(self):
+        for raw in ("[]", '"x"', "null", "42", ""):
+            with self.subTest(stdin=raw):
+                self.assertIn("🤖", self._main(raw))
+
+    def test_normal_stdin_renders_bars(self):
+        out = self._main(json.dumps({"session_id": "m1", "model": {"display_name": "Fable 5.1"},
+                                     "transcript_path": "", "cwd": ""}))
+        self.assertIn("🤖 Fable 5.1", out)
+        self.assertIn("5h", out)
 
 
 class NeedsRefreshTests(unittest.TestCase):

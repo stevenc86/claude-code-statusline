@@ -1209,6 +1209,10 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        # Valid JSON that isn't an object ([], "x", null) would otherwise crash the
+        # pre-render reads (data.get) outside render()'s try — and print a traceback.
+        data = {}
 
     if "--refresh" in sys.argv[1:]:
         refresh_local_cache(data)
