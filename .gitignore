@@ -6,3 +6,6 @@ __pycache__/
 
 # oh-my-claudecode local session/agent state
 .omc/
+
+# local Claude Code session summaries
+.claude_output/
