@@ -3,7 +3,7 @@
 A custom statusline for [Claude Code](https://claude.ai/code) with truecolor gradient bars and a macaron-inspired pastel palette.
 
 ```
-🤖 Claude Opus 4.8 v2.1.158 · ⚡ xhigh 💭 · ⎇ master +42 -10 · 🧠 290k (29%) · 📊 89% cache · ⏱ 21h17m · ⌛ 18s
+🤖 Claude Opus 4.8 v2.1.158 · ⚡ xhigh 💭 · ⎇ master +42 -10 · 🔀 #12 ✓ · 🧠 290k (29%) · 📊 89% cache ❄15:42 · ⏱ 21h17m · ⌛ 18s
 💰 $38.47 / $322.41 / $1641.98 · 💬 $2.86 · 🔥 $33.26/h →wk 18h · ✎ +180 -24 · ✓ 4/13 todo · 🔧 149 · 🌐 2 bg · 📝 /admin-login
 👥 3 · ├ architect 2m · ├ explore 45s · └ executor 1m       ← only when agents are running
 ───────────────── ◆ ─────────────────
@@ -17,7 +17,7 @@ Fable  ███████████████                 49%  (4d08h
 ## Features
 
 **Always shown (Line 1 — identity + state):**
-- 🤖 model (+ dim CC version) · ⚡ effort (+ 💭 when extended thinking is on) · ⎇ git branch & diff lines · 🧠 context tokens (with ⚠ at ≥ 80%) · 📊 cache hit rate · ⏱ session duration · ⌛ last response latency
+- 🤖 model (+ dim CC version) · 🚀 fast mode · ⚡ effort (+ 💭 when extended thinking is on) · ⎇ git branch & diff lines · 🔀 open PR / MR with review state · 🧠 context tokens (with ⚠ at ≥ 80%) · 📊 prompt-cache hit rate + when it goes cold · ⏱ session duration · ⌛ last response latency
 
 **Always shown (Line 2 — cost + activity):**
 - 💰 block / plan-week / month cost · 💬 this-session cost · 🔥 burn rate with `→wk` projection · ✎ session edit lines · ✓ todo progress · 🔧 tool call count · 🌐 background tasks · 🎨 non-default output style · 📝 last slash command
@@ -31,7 +31,7 @@ Fable  ███████████████                 49%  (4d08h
 - Per-character truecolor gradient (pistachio → mango → raspberry)
 
 **Live from the statusline input (per-session, real-time, never cross-session):**
-- Claude Code passes the current context window, plan quota, effort, cost, and flags on stdin every render. The statusline reads these directly — so context matches `/context` exactly (and is correct on the 1M beta), and a new session never shows another session's numbers.
+- Claude Code passes the current context window, plan quota, effort, cost, prompt-cache health, open PR, and flags on stdin every render. The statusline reads these directly — so context matches `/context` exactly (and is correct on the 1M beta), and a new session never shows another session's numbers.
 
 **Performance:**
 - ~20 ms render. All expensive work (3 ccusage calls + transcript scan + git status) runs in parallel in a detached, single-flight refresh worker; the main path never blocks.
@@ -49,11 +49,16 @@ Fable  ███████████████                 49%  (4d08h
 |------|-------|---------|--------|------------|
 | 🤖 | model | Current Claude model display name (+ dim CC `version`) | `model.display_name` / `version` from statusline input | never |
 | ⚡ | effort | Reasoning effort level (`low` / `medium` / `high` / `xhigh`) | live `effort.level` on stdin; `effortLevel` in `~/.claude/settings.json` as fallback | never (`-` if unset) |
+| 🚀 | fast | Fast mode is on (faster, pricier output) | `fast_mode` on stdin | fast mode off |
 | 💭 | thinking | Shown next to effort when extended thinking is enabled | `thinking.enabled` on stdin | thinking off |
 | ⎇ | branch | Current git branch, uncommitted line diff, ahead/behind counts | `git rev-parse`, `git rev-list`, `git diff HEAD --numstat` | not in a git repo |
+| 🔀 | PR | Open PR for the current branch (`#N`, or `!N` for a GitLab MR) + review state: ✓ approved · ✗ changes requested · … pending · `draft` | `pr` on stdin (mirrors Claude Code's footer badge) | no open PR |
 | 🧠 | context | Tokens used in current conversation + percent of model window | live `context_window` on stdin (matches `/context`, 1M-correct) | no `context_window` (then `>200k` if `exceeds_200k_tokens`, else `-`) |
 | ⚠ 🧠 | (warning) | Context icon turns red and adds ⚠ prefix | when context ≥ 80% | context < 80% |
-| 📊 | cache hit | Cache-read tokens ÷ total input tokens (session-wide) | aggregated `message.usage` in transcript | no usage data yet |
+| 📊 | cache hit | Cache-read tokens ÷ total input tokens (session-wide) | live `prompt_cache.hit_ratio` on stdin; aggregated transcript `message.usage` as fallback | no usage data yet |
+| ❄HH:MM | cache expiry | Wall-clock time the cached prefix goes cold (a wall-clock time, not a countdown, so it stays correct while the statusline sits idle) | `prompt_cache.expires_at` on stdin | cache not observed / no expiry |
+| ❄ cold | (warning) | The cache has expired — the next message re-caches the whole prefix | `prompt_cache.warm == false` | cache warm |
+| ✗N | cache misses | Requests whose cached prefix shrank with no compaction to explain it | `prompt_cache.misses` on stdin | 0 misses |
 | ⏱ | session | Wall-clock time since the first message in this transcript | transcript first `timestamp` | no session start found |
 | ⌛ | latency | Time between the last user message and last assistant response | transcript timestamps | no completed turn yet |
 

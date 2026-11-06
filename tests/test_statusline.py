@@ -484,6 +484,75 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("29%", out)
 
 
+class LiveStdinFieldTests(unittest.TestCase):
+    """prompt_cache / pr / fast_mode, read live from the statusline stdin."""
+
+    _PLAN = {"five_pct": 1.0, "five_reset": None, "wk_pct": 1.0, "wk_reset": None,
+             "cache_age": 1}
+
+    def _render(self, cache=None, **data):
+        rows = sl.render({"model": {"display_name": "X"}, **data}, cache or {}, self._PLAN)
+        return _strip_ansi(rows.split("\n")[0])  # Line 1
+
+    @staticmethod
+    def _pc(**over):
+        pc = {"warm": True, "caching_observed": True, "ttl": "1h",
+              "expires_at": int(time.time()) + 1800, "requests": 12, "misses": 0,
+              "hit_ratio": 0.982}
+        pc.update(over)
+        return pc
+
+    def test_read_prompt_cache_absent_or_malformed(self):
+        self.assertIsNone(sl.read_prompt_cache({}))
+        self.assertIsNone(sl.read_prompt_cache({"prompt_cache": "nope"}))
+        pc = sl.read_prompt_cache({"prompt_cache": {"hit_ratio": "x", "expires_at": True,
+                                                    "misses": "?"}})
+        self.assertEqual(pc, {"hit_pct": None, "warm": False, "expires_at": None,
+                              "observed": False, "misses": 0})
+
+    def test_live_hit_ratio_overrides_transcript_estimate(self):
+        line = self._render(cache={"tx_cache_hit_pct": 50.0}, prompt_cache=self._pc())
+        self.assertIn("📊 98% cache", line)
+        self.assertNotIn("50%", line)
+
+    def test_falls_back_to_transcript_estimate(self):
+        self.assertIn("📊 50% cache", self._render(cache={"tx_cache_hit_pct": 50.0}))
+
+    def test_warm_cache_shows_wall_clock_expiry(self):
+        pc = self._pc()
+        line = self._render(prompt_cache=pc)
+        self.assertIn("❄" + sl.fmt_clock(pc["expires_at"]), line)
+        self.assertNotIn("cold", line)
+
+    def test_cold_cache_and_misses(self):
+        line = self._render(prompt_cache=self._pc(warm=False, expires_at=None, misses=2))
+        self.assertIn("❄ cold", line)
+        self.assertIn("✗2", line)
+
+    def test_no_cache_field_without_any_hit_rate(self):
+        line = self._render(prompt_cache=self._pc(hit_ratio=None, caching_observed=False))
+        self.assertNotIn("📊", line)
+
+    def test_pr_badge(self):
+        line = self._render(pr={"number": 42, "url": "https://x/pull/42",
+                                "review_state": "approved"})
+        self.assertIn("🔀 #42 ✓", line)
+
+    def test_gitlab_mr_badge_and_draft(self):
+        line = self._render(pr={"number": 7, "kind": "mr", "review_state": "draft"})
+        self.assertIn("🔀 !7 draft", line)
+
+    def test_pr_absent_or_malformed(self):
+        self.assertNotIn("🔀", self._render())
+        self.assertNotIn("🔀", self._render(pr={"number": None}))
+        self.assertNotIn("🔀", self._render(pr="nope"))
+
+    def test_fast_mode_flag(self):
+        self.assertIn("🚀 fast", self._render(fast_mode=True))
+        self.assertNotIn("🚀", self._render(fast_mode=False))
+        self.assertNotIn("🚀", self._render())
+
+
 class ReadContextWindowTests(unittest.TestCase):
     def test_missing_field_returns_none(self):
         self.assertEqual(sl.read_context_window({}), (None, None, None))

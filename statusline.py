@@ -2,7 +2,7 @@
 """Claude Code statusline.
 
 Layout (lines printed top → bottom):
-    L1  🤖 model v · ⚡ effort 💭 · ⎇ branch · 🧠 ctx · 📊 cache · ⏱ session · ⌛ last
+    L1  🤖 model v · 🚀 fast · ⚡ effort 💭 · ⎇ branch · 🔀 #PR ✓ · 🧠 ctx · 📊 cache ❄HH:MM · ⏱ session · ⌛ last
     L2  💰 block/wk/mo · 💬 session · 🔥 burn →wk · ✎ session edits · ✓ todos · 🔧 tools · 🌐 bg · 🎨 style · 📝 last skill
     L3  👥 N · ├ agent A · ├ agent B · └ agent C       (only if agents > 0)
     ──  gradient divider ◆
@@ -32,7 +32,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -829,6 +829,91 @@ def _fmt_ctx_field(ctx_tokens, ctx_pct):
     return f"{ansi(*rgb_at(ctx_pct))}🧠 {body}{RESET}"
 
 
+def read_prompt_cache(data):
+    """Live prompt-cache health for this session from stdin `prompt_cache`
+    (present after the first API response; absent on older builds → None).
+
+    `hit_ratio` is the same cache_read / (read + creation + uncached input) ratio
+    the transcript scan estimates, but exact and per-session. `warm` and
+    `expires_at` are computed by Claude Code at render time; `misses` counts
+    requests whose cached prefix shrank without a compaction explaining it."""
+    pc = data.get("prompt_cache")
+    if not isinstance(pc, dict):
+        return None
+    try:
+        hit_pct = float(pc["hit_ratio"]) * 100 if pc.get("hit_ratio") is not None else None
+    except (TypeError, ValueError):
+        hit_pct = None
+    expires_at = pc.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        expires_at = None
+    try:
+        misses = int(pc.get("misses") or 0)
+    except (TypeError, ValueError):
+        misses = 0
+    return {"hit_pct": hit_pct, "warm": pc.get("warm") is True, "expires_at": expires_at,
+            "observed": pc.get("caching_observed") is True, "misses": misses}
+
+
+def fmt_clock(epoch):
+    """Local wall-clock HH:MM for a Unix epoch; '' if unparseable."""
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def _fmt_cache_field(tx_hit_pct, pc):
+    """📊 cache hit rate, plus when the cached prefix goes cold.
+
+    The live stdin `prompt_cache` wins over the transcript-derived estimate. The
+    expiry is shown as a wall-clock time (❄15:42 = "goes cold at 15:42") rather
+    than a countdown: the statusline only re-renders on events, so a countdown
+    would sit frozen while you're idle — exactly when you need to know whether
+    the next message will pay for a full cache rebuild."""
+    hit = pc["hit_pct"] if pc and pc["hit_pct"] is not None else tx_hit_pct
+    if hit is None:
+        return None
+    parts = [f"{MINT}📊 {int(round(hit))}% cache{RESET}"]
+    if pc and pc["observed"]:
+        if pc["warm"] and pc["expires_at"]:
+            clock = fmt_clock(pc["expires_at"])
+            if clock:
+                parts.append(f"{DIM}❄{clock}{RESET}")
+        elif not pc["warm"]:
+            parts.append(f"{SKY}❄ cold{RESET}")
+    if pc and pc["misses"] > 0:
+        parts.append(f"{PEACH}✗{pc['misses']}{RESET}")
+    return " ".join(parts)
+
+
+_PR_STATE = {
+    "approved": (MATCHA, "✓"),
+    "changes_requested": (PEACH, "✗"),
+    "pending": (LEMON, "…"),
+    "draft": (DIM, "draft"),
+}
+
+
+def _fmt_pr_field(data):
+    """🔀 open PR / MR for the current branch, from stdin `pr` (mirrors Claude
+    Code's footer badge): `#42` for GitHub, `!42` for a GitLab MR, plus a
+    review-state mark. None when there's no PR."""
+    pr = data.get("pr")
+    if not isinstance(pr, dict):
+        return None
+    try:
+        number = int(pr.get("number"))
+    except (TypeError, ValueError):
+        return None
+    prefix = "!" if pr.get("kind") == "mr" else "#"
+    out = f"{LAVENDER}🔀 {prefix}{number}{RESET}"
+    state = _PR_STATE.get(pr.get("review_state"))
+    if state:
+        out += f" {state[0]}{state[1]}{RESET}"
+    return out
+
+
 def _fmt_git_field(cache):
     branch = cache.get("git_branch")
     if not branch:
@@ -934,6 +1019,7 @@ def render(data, cache, plan):
     out_style = data.get("output_style") if isinstance(data.get("output_style"), dict) else {}
     style_name = out_style.get("name")
     exceeds_200k = bool(data.get("exceeds_200k_tokens"))
+    fast_on = data.get("fast_mode") is True
 
     # Account-wide cost (from cache / ccusage): current block, plan week, month.
     block_cost = cache.get("block_cost")
@@ -952,18 +1038,25 @@ def render(data, cache, plan):
     effort_str = f"{PEACH}⚡ {effort}{RESET}"
     if thinking_on:
         effort_str += " 💭"
-    l1_fields = [model_str, effort_str]
+    l1_fields = [model_str]
+    if fast_on:
+        l1_fields.append(f"{LEMON}🚀 fast{RESET}")  # fast mode: quicker, pricier output
+    l1_fields.append(effort_str)
     git_field = _fmt_git_field(cache)
     if git_field:
         l1_fields.append(f"{SKY}{git_field}{RESET}")
+    pr_field = _fmt_pr_field(data)
+    if pr_field:
+        l1_fields.append(pr_field)
     # exceeds_200k_tokens is redundant with a live % (it just means >200k used),
     # so surface it only as a coarse signal when no context_window % is available.
     if ctx_pct is None and exceeds_200k:
         l1_fields.append(f"🧠 {DIM}>200k{RESET}")
     else:
         l1_fields.append(_fmt_ctx_field(ctx_tokens, ctx_pct))
-    if cache_hit is not None:
-        l1_fields.append(f"{MINT}📊 {int(round(cache_hit))}% cache{RESET}")
+    cache_field = _fmt_cache_field(cache_hit, read_prompt_cache(data))
+    if cache_field:
+        l1_fields.append(cache_field)
     if session_start:
         l1_fields.append(f"{LAVENDER}⏱ {session_dur}{RESET}")
     if last_latency:
