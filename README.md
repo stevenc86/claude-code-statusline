@@ -3,12 +3,13 @@
 A custom statusline for [Claude Code](https://claude.ai/code) with truecolor gradient bars and a macaron-inspired pastel palette.
 
 ```
-🤖 Claude Opus 4.8 v2.1.158 · ⚡ xhigh 💭 · ⎇ master +42 -10 · 🧠 290k (29%) · 📊 89% cache · ⏱ 21h17m · ⌛ 18s
+🤖 Claude Opus 4.8 v2.1.158 · ⚡ xhigh 💭 · ⎇ master +42 -10 · 🔀 #12 ✓ · 🧠 290k (29%) · 📊 89% cache ❄15:42 · ⏱ 21h17m · ⌛ 18s
 💰 $38.47 / $322.41 / $1641.98 · 💬 $2.86 · 🔥 $33.26/h →wk 18h · ✎ +180 -24 · ✓ 4/13 todo · 🔧 149 · 🌐 2 bg · 📝 /admin-login
 👥 3 · ├ architect 2m · ├ explore 45s · └ executor 1m       ← only when agents are running
-5h   ████████                        26%  (3h42m)
-7d   █                                4%  (4d08h)
-Son  ███                             10%  (4d08h)   ← only when OMC HUD provides per-model usage
+───────────────── ◆ ─────────────────
+5h     ████████                        26%  (3h42m)
+7d     █                                4%  (4d08h)
+Fable  ███████████████                 49%  (4d08h)   ← per-model weekly limits, only when OMC HUD provides them
 ```
 
 > Bars are rendered with per-character truecolor RGB (24-bit ANSI). Each `#` is colored by its position on a green → amber → pink gradient.
@@ -16,7 +17,7 @@ Son  ███                             10%  (4d08h)   ← only when OMC HUD 
 ## Features
 
 **Always shown (Line 1 — identity + state):**
-- 🤖 model (+ dim CC version) · ⚡ effort (+ 💭 when extended thinking is on) · ⎇ git branch & diff lines · 🧠 context tokens (with ⚠ at ≥ 80%) · 📊 cache hit rate · ⏱ session duration · ⌛ last response latency
+- 🤖 model (+ dim CC version) · 🚀 fast mode · ⚡ effort (+ 💭 when extended thinking is on) · ⎇ git branch & diff lines · 🔀 open PR / MR with review state · 🧠 context tokens (with ⚠ at ≥ 80%) · 📊 prompt-cache hit rate + when it goes cold · ⏱ session duration · ⌛ last response latency
 
 **Always shown (Line 2 — cost + activity):**
 - 💰 block / plan-week / month cost · 💬 this-session cost · 🔥 burn rate with `→wk` projection · ✎ session edit lines · ✓ todo progress · 🔧 tool call count · 🌐 background tasks · 🎨 non-default output style · 📝 last slash command
@@ -26,15 +27,15 @@ Son  ███                             10%  (4d08h)   ← only when OMC HUD 
 
 **Plan bars (Line 4+):**
 - Real Anthropic 5h and 7d quota — live from the statusline input's `rate_limits` when Claude Code provides it, falling back to the OMC HUD cache otherwise
-- Optional **Sonnet weekly** sub-limit bar (`Son`), shown only when the OMC HUD provides per-model usage (it's not in the statusline stdin)
+- Optional **per-model weekly** sub-limit bars (e.g. `Fable`, plus legacy `Son` / `Opus`), shown only when the OMC HUD provides per-model usage (it's not in the statusline stdin)
 - Per-character truecolor gradient (pistachio → mango → raspberry)
 
 **Live from the statusline input (per-session, real-time, never cross-session):**
-- Claude Code passes the current context window, plan quota, effort, cost, and flags on stdin every render. The statusline reads these directly — so context matches `/context` exactly (and is correct on the 1M beta), and a new session never shows another session's numbers.
+- Claude Code passes the current context window, plan quota, effort, cost, prompt-cache health, open PR, and flags on stdin every render. The statusline reads these directly — so context matches `/context` exactly (and is correct on the 1M beta), and a new session never shows another session's numbers.
 
 **Performance:**
 - ~20 ms render. All expensive work (3 ccusage calls + transcript scan + git status) runs in parallel in a detached, single-flight refresh worker; the main path never blocks.
-- Incremental refresh: re-scans transcript / git only when their mtime changes.
+- Incremental refresh: re-scans transcript / git only when their mtime changes — compared per session, so one busy session doesn't make the others refresh.
 
 **Other:**
 - Pure Python — no Node.js runtime, no compiled binary
@@ -48,11 +49,16 @@ Son  ███                             10%  (4d08h)   ← only when OMC HUD 
 |------|-------|---------|--------|------------|
 | 🤖 | model | Current Claude model display name (+ dim CC `version`) | `model.display_name` / `version` from statusline input | never |
 | ⚡ | effort | Reasoning effort level (`low` / `medium` / `high` / `xhigh`) | live `effort.level` on stdin; `effortLevel` in `~/.claude/settings.json` as fallback | never (`-` if unset) |
+| 🚀 | fast | Fast mode is on (faster, pricier output) | `fast_mode` on stdin | fast mode off |
 | 💭 | thinking | Shown next to effort when extended thinking is enabled | `thinking.enabled` on stdin | thinking off |
 | ⎇ | branch | Current git branch, uncommitted line diff, ahead/behind counts | `git rev-parse`, `git rev-list`, `git diff HEAD --numstat` | not in a git repo |
+| 🔀 | PR | Open PR for the current branch (`#N`, or `!N` for a GitLab MR) + review state: ✓ approved · ✗ changes requested · … pending · `draft` | `pr` on stdin (mirrors Claude Code's footer badge) | no open PR |
 | 🧠 | context | Tokens used in current conversation + percent of model window | live `context_window` on stdin (matches `/context`, 1M-correct) | no `context_window` (then `>200k` if `exceeds_200k_tokens`, else `-`) |
 | ⚠ 🧠 | (warning) | Context icon turns red and adds ⚠ prefix | when context ≥ 80% | context < 80% |
-| 📊 | cache hit | Cache-read tokens ÷ total input tokens (session-wide) | aggregated `message.usage` in transcript | no usage data yet |
+| 📊 | cache hit | Cache-read tokens ÷ total input tokens (session-wide) | live `prompt_cache.hit_ratio` on stdin; aggregated transcript `message.usage` as fallback | no usage data yet |
+| ❄HH:MM | cache expiry | Wall-clock time the cached prefix goes cold (a wall-clock time, not a countdown, so it stays correct while the statusline sits idle) | `prompt_cache.expires_at` on stdin | cache not observed / no expiry |
+| ❄ cold | (warning) | The cache has expired — the next message re-caches the whole prefix | `prompt_cache.warm == false` | cache warm |
+| ✗N | cache misses | Requests whose cached prefix shrank with no compaction to explain it | `prompt_cache.misses` on stdin | 0 misses |
 | ⏱ | session | Wall-clock time since the first message in this transcript | transcript first `timestamp` | no session start found |
 | ⌛ | latency | Time between the last user message and last assistant response | transcript timestamps | no completed turn yet |
 
@@ -66,8 +72,8 @@ Son  ███                             10%  (4d08h)   ← only when OMC HUD 
 | →wk | projection | Hours until current burn rate fills the weekly plan quota | computed from burn + plan-week % | projection > 7 days or wk_pct ≤ 0 |
 | →wk (red) | (warning) | Projection turns red when imminent | when projection < 24 h | projection ≥ 24 h |
 | ✓ | todos | `pending/total` — based on `TaskCreate` / `TaskUpdate` tool calls | transcript tool_use scan | no `TaskCreate` in transcript |
-| 🔧 | tools | Total `tool_use` calls in this session | transcript tool_use count | count = 0 |
-| 🌐 | bg | Background-mode Bash calls started recently and not yet completed | Bash tool_uses with `run_in_background=true` minus task-completion markers | count = 0 |
+| 🔧 | tools | Total `tool_use` calls in this session | transcript tool_use count (conversation entries only — `api-request-*` debug records are skipped) | count = 0 |
+| 🌐 | bg | Background-mode Bash calls started recently and not yet completed | Bash tool_uses with `run_in_background=true` whose `<task-notification>` (matched by `<tool-use-id>`) hasn't arrived | count = 0 |
 | ✎ | session edits | Lines Claude added / removed **this session** (distinct from the git working-tree diff on Line 1) | `cost.total_lines_added` / `total_lines_removed` on stdin | both zero |
 | 🎨 | output style | Active output style when not `default` | `output_style.name` on stdin | style is `default`/absent |
 | 📝 | last slash | The most recently invoked slash command | `<command-name>` / `<command-message>` tags in user-role text | always shown (`-` if none) |
@@ -76,10 +82,10 @@ Son  ███                             10%  (4d08h)   ← only when OMC HUD 
 
 | Icon | Field | Meaning |
 |------|-------|---------|
-| 👥 | count | Number of `Task` tool_use entries with no matching tool_result yet |
+| 👥 | count | Sub-agent (`Agent`, formerly `Task`) tool_use entries still running: no tool_result yet, or — for background launches — no `<task-notification>` yet. Agents older than 2 h are assumed dead |
 | ├ / └ | tree | Tree branches for each running agent — last entry uses └ |
-| agent name | name | `subagent_type` from the Task tool input |
-| duration | elapsed | Time since that agent's `Task` tool_use started |
+| agent name | name | `name`, else `subagent_type`, else `description` from the tool input |
+| duration | elapsed | Time since that agent's tool_use started |
 
 Entire line is omitted when no agents are running.
 
@@ -89,7 +95,8 @@ Entire line is omitted when no agents are running.
 |------|-------|---------|--------|
 | 5h | bar | Current 5-hour plan quota usage with reset countdown | live `rate_limits.five_hour` on stdin; OMC HUD cache as fallback |
 | 7d | bar | Current 7-day (overall) plan quota usage with reset countdown | live `rate_limits.seven_day` on stdin; OMC HUD cache as fallback |
-| Son | bar | Sonnet weekly sub-limit usage with reset countdown | OMC HUD cache (`sonnetWeeklyPercent`) — not in stdin; hidden when unavailable |
+| Fable (etc.) | bar | Per-model weekly sub-limit usage with reset countdown, one bar per bucket | OMC HUD cache (`scopedWeeklyBuckets`) — not in stdin; hidden when unavailable |
+| Son / Opus | bar | Legacy Sonnet / Opus weekly sub-limits | OMC HUD cache (`sonnetWeeklyPercent` / `opusWeeklyPercent`); hidden when unavailable |
 | (bold %) | (warning) | Percentage rendered in bold when ≥ 90% | applied at render time |
 
 ### Color palette (per-character bar gradient)
@@ -118,8 +125,8 @@ Refresh triggers (any of):
 Refreshes are **single-flight**: spawning a refresh worker is gated by an on-disk lock (`~/.claude/.statusline-refresh.lock`), so an actively streaming session—where the transcript mtime changes constantly—never piles up redundant refresh subprocesses. At most one refresh runs at a time; an abandoned lock is reclaimed after 45 s.
 
 Caches:
-- `~/.claude/.statusline-cache.json` — cost / burn / git / transcript-derived fields (this script maintains). Context and plan quota are **not** cached here — they're read live from the statusline input on every render.
-- `~/.claude/plugins/oh-my-claudecode/.usage-cache-anthropic.json` — 5h / 7d / Sonnet-weekly plan quota (OMC HUD maintains, 60 s TTL). The 5h/7d *display* prefers the real-time stdin `rate_limits`, but this cache is the only source of the per-model **Sonnet** bar and the 5h/7d fallback, so the HUD still refreshes when installed.
+- `~/.claude/.statusline-cache.json` — cost / burn / git / transcript-derived fields (this script maintains). Account-wide ccusage costs sit at the top level; git and transcript-derived fields are stored **per session** under `sessions.<session_id>`, so several concurrent Claude Code sessions each show their own tool count, agents, and latency instead of overwriting one another. Session entries idle for 24 h are pruned (at most 30 kept). Context and plan quota are **not** cached here — they're read live from the statusline input on every render.
+- `~/.claude/plugins/oh-my-claudecode/.usage-cache-anthropic.json` — 5h / 7d / per-model weekly plan quota (OMC HUD maintains, 60 s TTL). The 5h/7d *display* prefers the real-time stdin `rate_limits`, but this cache is the only source of the per-model bars (**Fable**, Sonnet, Opus) and the 5h/7d fallback, so the HUD still refreshes when installed.
 
 ## Requirements
 
@@ -129,12 +136,12 @@ Caches:
 |------------|--------------|----------------|
 | Python 3.9+ | Everything | Usually pre-installed |
 | [ccusage](https://github.com/ryoppippi/ccusage) | Account-wide cost tracking (block / week / month) | `npm i -g ccusage` (the installer offers this) |
-| [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) plugin (OMC HUD) | Sonnet weekly bar (only source); 5h / 7d fallback when stdin lacks `rate_limits` | `claude plugin install oh-my-claudecode@omc` (the installer offers this, opt-in) |
+| [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) plugin (OMC HUD) | Per-model weekly bars such as Fable (only source); 5h / 7d fallback when stdin lacks `rate_limits` | `claude plugin install oh-my-claudecode@omc` (the installer offers this, opt-in) |
 
 You don't have to install these by hand — `./install.sh` offers to set up `ccusage`
 automatically and can optionally install the `oh-my-claudecode` plugin for you.
 
-Context (🧠) and the 5h / 7d bars come straight from the statusline input Claude Code provides, so they work with no extra dependencies. The OMC HUD adds the per-model **Sonnet** bar (which the stdin input doesn't carry) and acts as the 5h / 7d fallback; ccusage powers the account-wide cost line.
+Context (🧠) and the 5h / 7d bars come straight from the statusline input Claude Code provides, so they work with no extra dependencies. The OMC HUD adds the per-model bars such as **Fable** (which the stdin input doesn't carry) and acts as the 5h / 7d fallback; ccusage powers the account-wide cost line.
 
 ## Install
 
@@ -209,7 +216,7 @@ RED_RGB   = (255, 158, 178)          # 100% — raspberry
 
 - **5h bar**: Anthropic plan's current 5-hour rate-limit quota (e.g. Pro/Max session limit). Reset time also from Anthropic API.
 - **7d bar**: Anthropic plan's current weekly (overall) rate-limit quota. Reset is plan-specific (commonly Monday morning UTC).
-- **Son bar**: Sonnet's weekly sub-limit, shown only when the OMC HUD reports per-model usage (`sonnetWeeklyPercent`). The statusline stdin doesn't expose per-model breakdowns, so without the OMC HUD this bar is hidden.
+- **Per-model bars (`Fable`, `Son`, `Opus`)**: weekly sub-limits for a single model family, shown only when the OMC HUD reports them (`scopedWeeklyBuckets`, or the legacy `sonnetWeeklyPercent` / `opusWeeklyPercent`). The usage API reports these as `weekly_scoped` limits; the statusline stdin doesn't expose per-model breakdowns, so without the OMC HUD these bars are hidden.
 - **Bar fill %**: how much of your plan quota you've consumed
 - **Bar color (per character)**: position in the bar — green at the start, red at the end, regardless of fill
 - **Percentage text color**: based on the percentage value — green at low, red at high (and overflow)
@@ -236,7 +243,7 @@ rm -f ~/.claude/.statusline-cache.json   # safe to remove anytime
 
 - Plan-week cost slightly overestimates: ccusage groups by full calendar day, so the partial day at the week boundary is included in full
 - Slash command detection scans transcript regex matches — only counts commands recorded with `<command-name>` or `<command-message>` tags
-- Agent count uses Task tool_use start/end counting from transcript — may be off if tool_use_result entries are missing or out of order
+- Agent count uses Agent/Task tool_use start/end counting from transcript (plus `<task-notification>` for background agents) — may be off if result or notification entries are missing, or if a finished background agent is resumed via SendMessage
 
 ## License
 

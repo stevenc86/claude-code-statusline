@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -31,6 +32,11 @@ _spec.loader.exec_module(sl)
 def tearDownModule():
     """Remove the throwaway config dir once the whole suite has finished."""
     shutil.rmtree(_SCRATCH, ignore_errors=True)
+
+
+def _strip_ansi(s):
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
 
 
 class FakeRun:
@@ -158,11 +164,13 @@ class ScanTranscriptTests(unittest.TestCase):
         self.assertEqual(out["last_slash"], "-")
 
     def test_full_scan(self):
+        # Recent timestamps: an unfinished agent older than AGENT_LOOKBACK_SECS is
+        # (correctly) treated as dead, so a fixed historical date would drop it.
         path = self._write([
-            {"type": "user", "timestamp": "2026-05-29T00:00:00Z",
+            {"type": "user", "timestamp": self._ts(65),
              "message": {"role": "user",
                          "content": [{"type": "text", "text": "<command-name>admin-login</command-name>"}]}},
-            {"type": "assistant", "timestamp": "2026-05-29T00:00:05Z",
+            {"type": "assistant", "timestamp": self._ts(60),
              "message": {"role": "assistant",
                          "usage": {"input_tokens": 100, "cache_read_input_tokens": 900},
                          "content": [
@@ -191,6 +199,122 @@ class ScanTranscriptTests(unittest.TestCase):
                          "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}]}},
         ])
         out = sl.scan_transcript(path)
+        self.assertEqual(out["agents_running"], 0)
+
+    # --- current builds: sub-agent tool is "Agent", often launched async ---
+
+    @staticmethod
+    def _ts(ago_secs=0):
+        t = time.time() - ago_secs
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+    def _agent_use(self, tid="toolu_A1", ago=60, **inp):
+        return {"type": "assistant", "timestamp": self._ts(ago),
+                "message": {"role": "assistant",
+                            "content": [{"type": "tool_use", "id": tid, "name": "Agent",
+                                         "input": {"description": "Review the diff",
+                                                   "subagent_type": "code-reviewer", **inp}}]}}
+
+    def _async_ack(self, tid="toolu_A1"):
+        return {"type": "user", "timestamp": self._ts(55),
+                "message": {"role": "user",
+                            "content": [{"type": "tool_result", "tool_use_id": tid,
+                                         "content": [{"type": "text",
+                                                      "text": "Async agent launched successfully."}]}]},
+                "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                  "agentId": "a1b2c3"}}
+
+    @staticmethod
+    def _notification(tid="toolu_A1", task_id="a1b2c3", status="completed"):
+        return (f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tid}</tool-use-id>\n<status>{status}</status>\n"
+                f"<summary>done</summary>\n</task-notification>")
+
+    def test_agent_tool_counts_as_running_agent(self):
+        path = self._write([self._agent_use()])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["agents_running"], 1)
+        self.assertEqual(out["agent_details"][0]["name"], "code-reviewer")
+
+    def test_agent_name_preferred_over_subagent_type(self):
+        path = self._write([self._agent_use(name="selfreview")])
+        self.assertEqual(sl.scan_transcript(path)["agent_details"][0]["name"], "selfreview")
+
+    def test_async_agent_stays_running_after_launch_ack(self):
+        # The tool_result of a background launch is only an ack, not completion.
+        path = self._write([self._agent_use(), self._async_ack()])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 1)
+
+    def test_async_agent_cleared_by_user_string_notification(self):
+        path = self._write([
+            self._agent_use(), self._async_ack(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user", "content": self._notification()}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_async_agent_cleared_by_queued_attachment_notification(self):
+        # Delivered mid-turn, the notification lands in an attachment record.
+        path = self._write([
+            self._agent_use(), self._async_ack(),
+            {"type": "attachment", "timestamp": self._ts(5),
+             "attachment": {"type": "queued_command", "prompt": self._notification()}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_sync_agent_result_clears_running(self):
+        path = self._write([
+            self._agent_use(),
+            {"type": "user", "timestamp": self._ts(30),
+             "message": {"role": "user",
+                         "content": [{"type": "tool_result", "tool_use_id": "toolu_A1",
+                                      "content": "review done"}]}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_ancient_unfinished_agent_is_dropped(self):
+        ago = sl.AGENT_LOOKBACK_SECS + 600
+        path = self._write([self._agent_use(ago=ago)])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_debug_request_records_are_not_double_counted(self):
+        # `api-request-blob` replays earlier messages, tool_use blocks included.
+        use = self._agent_use()
+        blob = {"type": "api-request-blob", "timestamp": self._ts(1),
+                "message": {"role": "user", "content": use["message"]["content"]}}
+        path = self._write([use, blob])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["tool_count"], 1)
+
+    def _bg_bash(self, tid="toolu_B1"):
+        return {"type": "assistant", "timestamp": self._ts(60),
+                "message": {"role": "assistant",
+                            "content": [{"type": "tool_use", "id": tid, "name": "Bash",
+                                         "input": {"command": "sleep 99",
+                                                   "run_in_background": True}}]}}
+
+    def test_bg_bash_running_until_notified(self):
+        path = self._write([self._bg_bash()])
+        self.assertEqual(sl.scan_transcript(path)["bg_count"], 1)
+
+    def test_bg_bash_cleared_by_tool_use_id_notification(self):
+        path = self._write([
+            self._bg_bash(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user",
+                         "content": self._notification(tid="toolu_B1", task_id="b9")}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["bg_count"], 0)
+
+    def test_agent_notification_does_not_clear_bg_bash(self):
+        # A completed *agent* must not be subtracted from the running bg Bash count.
+        path = self._write([
+            self._bg_bash(), self._agent_use(), self._async_ack(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user", "content": self._notification()}},
+        ])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["bg_count"], 1)
         self.assertEqual(out["agents_running"], 0)
 
 
@@ -317,12 +441,39 @@ class RenderTests(unittest.TestCase):
         plan = {**self._plan(), "sonnet_pct": 10.0, "sonnet_reset": None}
         out = sl.render({"model": {"display_name": "X"}}, {}, plan)
         self.assertIn("Son", out)
-        self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + 3 bars
+        self.assertEqual(out.count("\n") + 1, 6)  # 2 status lines + divider + 3 bars
 
     def test_sonnet_bar_omitted_when_absent(self):
         out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
         self.assertNotIn("Son", out)
-        self.assertEqual(out.count("\n") + 1, 4)  # 2 status lines + 2 bars
+        self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + divider + 2 bars
+
+    def test_scoped_fable_bar_shown_and_aligned(self):
+        plan = {**self._plan(),
+                "scoped": [{"label": "Fable", "pct": 49.0, "reset": None}]}
+        out = sl.render({"model": {"display_name": "X"}}, {}, plan)
+        rows = [_strip_ansi(r) for r in out.split("\n")]
+        bar_rows = [r for r in rows if r.startswith(("5h", "7d", "Fable"))]
+        self.assertEqual(len(bar_rows), 3)
+        self.assertIn("49%", bar_rows[-1])
+        # Labels are padded to the longest one, so every bar track (first fill
+        # char) starts at the same column: label width + 2-space gap.
+        self.assertEqual({r.index(sl.FILL_CHAR) for r in bar_rows}, {len("Fable") + 2})
+        self.assertEqual(out.count("\n") + 1, 6)  # 2 status lines + divider + 3 bars
+
+    def test_opus_bar_shown_when_present(self):
+        plan = {**self._plan(), "opus_pct": 12.0, "opus_reset": None}
+        self.assertIn("Opus", sl.render({"model": {"display_name": "X"}}, {}, plan))
+
+    def test_divider_separates_text_from_bars(self):
+        out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
+        rows = out.split("\n")
+        divider_idx = next(i for i, r in enumerate(rows) if "─" in r)
+        first_bar_idx = next(i for i, r in enumerate(rows) if "5h" in r)
+        # The rule sits between the status text and the first bar.
+        self.assertLess(divider_idx, first_bar_idx)
+        self.assertNotIn("5h", rows[divider_idx])
+        self.assertIn("◆", rows[divider_idx])  # centered ornament
 
     def test_no_context_window_shows_placeholder_not_stale_cache(self):
         # Context is live-only now. A stale cache value must NOT leak in (that was
@@ -332,6 +483,75 @@ class RenderTests(unittest.TestCase):
         self.assertIn("🧠 -", out)
         self.assertNotIn("290k", out)
         self.assertNotIn("29%", out)
+
+
+class LiveStdinFieldTests(unittest.TestCase):
+    """prompt_cache / pr / fast_mode, read live from the statusline stdin."""
+
+    _PLAN = {"five_pct": 1.0, "five_reset": None, "wk_pct": 1.0, "wk_reset": None,
+             "cache_age": 1}
+
+    def _render(self, cache=None, **data):
+        rows = sl.render({"model": {"display_name": "X"}, **data}, cache or {}, self._PLAN)
+        return _strip_ansi(rows.split("\n")[0])  # Line 1
+
+    @staticmethod
+    def _pc(**over):
+        pc = {"warm": True, "caching_observed": True, "ttl": "1h",
+              "expires_at": int(time.time()) + 1800, "requests": 12, "misses": 0,
+              "hit_ratio": 0.982}
+        pc.update(over)
+        return pc
+
+    def test_read_prompt_cache_absent_or_malformed(self):
+        self.assertIsNone(sl.read_prompt_cache({}))
+        self.assertIsNone(sl.read_prompt_cache({"prompt_cache": "nope"}))
+        pc = sl.read_prompt_cache({"prompt_cache": {"hit_ratio": "x", "expires_at": True,
+                                                    "misses": "?"}})
+        self.assertEqual(pc, {"hit_pct": None, "warm": False, "expires_at": None,
+                              "observed": False, "misses": 0})
+
+    def test_live_hit_ratio_overrides_transcript_estimate(self):
+        line = self._render(cache={"tx_cache_hit_pct": 50.0}, prompt_cache=self._pc())
+        self.assertIn("📊 98% cache", line)
+        self.assertNotIn("50%", line)
+
+    def test_falls_back_to_transcript_estimate(self):
+        self.assertIn("📊 50% cache", self._render(cache={"tx_cache_hit_pct": 50.0}))
+
+    def test_warm_cache_shows_wall_clock_expiry(self):
+        pc = self._pc()
+        line = self._render(prompt_cache=pc)
+        self.assertIn("❄" + sl.fmt_clock(pc["expires_at"]), line)
+        self.assertNotIn("cold", line)
+
+    def test_cold_cache_and_misses(self):
+        line = self._render(prompt_cache=self._pc(warm=False, expires_at=None, misses=2))
+        self.assertIn("❄ cold", line)
+        self.assertIn("✗2", line)
+
+    def test_no_cache_field_without_any_hit_rate(self):
+        line = self._render(prompt_cache=self._pc(hit_ratio=None, caching_observed=False))
+        self.assertNotIn("📊", line)
+
+    def test_pr_badge(self):
+        line = self._render(pr={"number": 42, "url": "https://x/pull/42",
+                                "review_state": "approved"})
+        self.assertIn("🔀 #42 ✓", line)
+
+    def test_gitlab_mr_badge_and_draft(self):
+        line = self._render(pr={"number": 7, "kind": "mr", "review_state": "draft"})
+        self.assertIn("🔀 !7 draft", line)
+
+    def test_pr_absent_or_malformed(self):
+        self.assertNotIn("🔀", self._render())
+        self.assertNotIn("🔀", self._render(pr={"number": None}))
+        self.assertNotIn("🔀", self._render(pr="nope"))
+
+    def test_fast_mode_flag(self):
+        self.assertIn("🚀 fast", self._render(fast_mode=True))
+        self.assertNotIn("🚀", self._render(fast_mode=False))
+        self.assertNotIn("🚀", self._render())
 
 
 class ReadContextWindowTests(unittest.TestCase):
@@ -414,6 +634,170 @@ class PlanUsageTests(unittest.TestCase):
     def test_missing_sonnet_is_none(self):
         sl.USAGE_CACHE.write_text(json.dumps({"data": {"weeklyPercent": 59}}))
         self.assertIsNone(sl.get_plan_usage()["sonnet_pct"])
+        self.assertEqual(sl.get_plan_usage()["scoped"], [])
+
+    def test_reads_scoped_fable_bucket_from_omc_cache(self):
+        # Shape written by OMC 5.7.x from the usage API's limits[] weekly_scoped rows.
+        sl.USAGE_CACHE.write_text(json.dumps({
+            "timestamp": int(time.time() * 1000),
+            "data": {"fiveHourPercent": 14, "weeklyPercent": 32,
+                     "scopedWeeklyBuckets": [
+                         {"id": "fable", "label": "Fable", "percent": 49,
+                          "resetsAt": "2026-11-10T10:00:00.446Z", "isActive": True}]},
+        }))
+        info = sl.get_plan_usage()
+        self.assertEqual(info["scoped"], [
+            {"label": "Fable", "pct": 49.0, "reset": "2026-11-10T10:00:00.446Z"}])
+        self.assertIsNone(info["sonnet_pct"])
+
+    def test_malformed_scoped_buckets_are_skipped(self):
+        sl.USAGE_CACHE.write_text(json.dumps({"data": {"scopedWeeklyBuckets": [
+            "nope", {"label": "NoPct"}, {"label": "", "percent": 5},
+            {"id": "x", "label": "Extremely Long Name", "percent": "7"},
+        ]}}))
+        self.assertEqual(sl.get_plan_usage()["scoped"], [
+            {"label": "Extrem", "pct": 7.0, "reset": None}])
+
+    def test_scoped_buckets_not_a_list_is_safe(self):
+        sl.USAGE_CACHE.write_text(json.dumps({"data": {"scopedWeeklyBuckets": {"a": 1}}}))
+        self.assertEqual(sl.get_plan_usage()["scoped"], [])
+
+
+class PerSessionCacheTests(unittest.TestCase):
+    """Local cache: account-wide ccusage fields shared, tx_*/git_* per session."""
+
+    def setUp(self):
+        self._orig = {n: getattr(sl, n) for n in
+                      ("_ccusage_blocks", "_ccusage_monthly", "_ccusage_plan_week")}
+        sl._ccusage_blocks = lambda: {"block_cost": 3.0, "burn": 1.5}
+        sl._ccusage_monthly = lambda: {"monthly_cost": 30.0}
+        sl._ccusage_plan_week = lambda reset: {"plan_week_cost": 9.0, "plan_week_reset": reset}
+
+    def tearDown(self):
+        for n, fn in self._orig.items():
+            setattr(sl, n, fn)
+        for p in (sl.LOCAL_CACHE, sl.REFRESH_LOCK):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _transcript(self, n_tools):
+        fd, path = tempfile.mkstemp(suffix=".jsonl", dir=_SCRATCH)
+        content = [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {}}
+                   for i in range(n_tools)]
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": "2026-11-06T00:00:00Z",
+                                "message": {"role": "assistant", "content": content}}) + "\n")
+        return path
+
+    def test_session_key_fallbacks(self):
+        self.assertEqual(sl.session_key({"session_id": "abc", "transcript_path": "/t"}), "abc")
+        self.assertEqual(sl.session_key({"transcript_path": "/t"}), "/t")
+        self.assertEqual(sl.session_key({}), "_default")
+        self.assertEqual(sl.session_key(None), "_default")
+
+    def test_view_merges_account_fields_with_own_session_only(self):
+        cache = {"block_cost": 3.0, "monthly_cost": 30.0,
+                 "sessions": {"A": {"tx_tool_count": 5}, "B": {"tx_tool_count": 77}}}
+        view = sl.session_view(cache, {"session_id": "A"})
+        self.assertEqual(view, {"block_cost": 3.0, "monthly_cost": 30.0, "tx_tool_count": 5})
+
+    def test_legacy_flat_cache_leaks_no_transcript_fields(self):
+        legacy = {"block_cost": 3.0, "tx_tool_count": 985, "ctx_pct": 8.0,
+                  "timestamp": time.time(), "transcript_mtime": 1.0}
+        view = sl.session_view(legacy, {"session_id": "A"})
+        self.assertEqual(view, {"block_cost": 3.0})
+        self.assertTrue(sl.needs_refresh({"session_id": "A"}, view, {}))
+
+    def test_other_sessions_refresh_does_not_make_this_one_stale(self):
+        now = time.time()
+        cache = {"sessions": {
+            "A": {"timestamp": now, "transcript_mtime": None, "git_index_mtime": None},
+            "B": {"timestamp": now - 3600}}}
+        a = {"session_id": "A", "transcript_path": ""}
+        self.assertFalse(sl.needs_refresh(a, sl.session_view(cache, a), {}))
+        self.assertTrue(sl.needs_refresh({"session_id": "C"},
+                                         sl.session_view(cache, {"session_id": "C"}), {}))
+
+    def test_refresh_writes_own_session_and_keeps_others(self):
+        now = time.time()
+        sl.write_local_cache_atomic({
+            "block_cost": 1.0, "tx_tool_count": 985, "ctx_pct": 8.0,   # legacy flat keys
+            "sessions": {
+                "A": {"tx_tool_count": 5, "timestamp": now - 10},
+                "stale": {"tx_tool_count": 1, "timestamp": now - sl.SESSION_CACHE_TTL - 60},
+            }})
+        sl.try_acquire_lock(sl.REFRESH_LOCK, sl.REFRESH_LOCK_TTL)
+        sl.refresh_local_cache({"session_id": "B", "transcript_path": self._transcript(2),
+                                "cwd": ""})
+        out = sl.read_local_cache()
+        self.assertEqual(set(out["sessions"]), {"A", "B"})        # stale pruned
+        self.assertEqual(out["sessions"]["A"]["tx_tool_count"], 5)  # untouched
+        self.assertEqual(out["sessions"]["B"]["tx_tool_count"], 2)
+        self.assertEqual(out["block_cost"], 3.0)                    # account-wide, refreshed
+        self.assertEqual(out["monthly_cost"], 30.0)
+        self.assertNotIn("tx_tool_count", out)                      # legacy keys dropped
+        self.assertNotIn("ctx_pct", out)
+        self.assertFalse(sl.REFRESH_LOCK.exists())                  # lock released
+
+    def test_failed_task_keeps_previous_session_values(self):
+        now = time.time()
+        sl.write_local_cache_atomic({"sessions": {"A": {"tx_tool_count": 5,
+                                                        "timestamp": now - 10}}})
+        orig_scan = sl.scan_transcript
+        sl.scan_transcript = lambda path: 1 / 0
+        try:
+            sl.refresh_local_cache({"session_id": "A", "transcript_path": "", "cwd": ""})
+        finally:
+            sl.scan_transcript = orig_scan
+        entry = sl.read_local_cache()["sessions"]["A"]
+        self.assertEqual(entry["tx_tool_count"], 5)
+        self.assertGreater(entry["timestamp"], now - 10)
+
+    def test_prune_caps_session_count(self):
+        now = time.time()
+        sessions = {f"s{i}": {"timestamp": now - i} for i in range(sl.SESSION_CACHE_MAX + 5)}
+        sessions["junk"] = "not a dict"
+        kept = sl._prune_sessions(sessions, now)
+        self.assertEqual(len(kept), sl.SESSION_CACHE_MAX)
+        self.assertIn("s0", kept)                                   # newest kept
+        self.assertNotIn(f"s{sl.SESSION_CACHE_MAX + 4}", kept)      # oldest dropped
+
+
+class MainTests(unittest.TestCase):
+    """End-to-end main(): stdin in, statusline out, never a traceback."""
+
+    def setUp(self):
+        import io
+        self._io = io
+        self._saved = (sys.stdin, sys.stdout, sys.argv,
+                       sl.refresh_local_cache_async, sl.refresh_usage_cache_async)
+        sl.refresh_local_cache_async = lambda data: False   # never spawn workers
+        sl.refresh_usage_cache_async = lambda data: None
+        sys.argv = ["statusline.py"]
+
+    def tearDown(self):
+        (sys.stdin, sys.stdout, sys.argv,
+         sl.refresh_local_cache_async, sl.refresh_usage_cache_async) = self._saved
+        sl.release_lock(sl.REFRESH_LOCK)
+
+    def _main(self, stdin_text):
+        sys.stdin = self._io.StringIO(stdin_text)
+        sys.stdout = out = self._io.StringIO()
+        self.assertEqual(sl.main(), 0)
+        return out.getvalue()
+
+    def test_non_object_json_stdin_does_not_crash(self):
+        for raw in ("[]", '"x"', "null", "42", ""):
+            with self.subTest(stdin=raw):
+                self.assertIn("🤖", self._main(raw))
+
+    def test_normal_stdin_renders_bars(self):
+        out = self._main(json.dumps({"session_id": "m1", "model": {"display_name": "Fable 5.1"},
+                                     "transcript_path": "", "cwd": ""}))
+        self.assertIn("🤖 Fable 5.1", out)
+        self.assertIn("5h", out)
 
 
 class NeedsRefreshTests(unittest.TestCase):

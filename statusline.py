@@ -2,15 +2,17 @@
 """Claude Code statusline.
 
 Layout (lines printed top → bottom):
-    L1  🤖 model v · ⚡ effort 💭 · ⎇ branch · 🧠 ctx · 📊 cache · ⏱ session · ⌛ last
+    L1  🤖 model v · 🚀 fast · ⚡ effort 💭 · ⎇ branch · 🔀 #PR ✓ · 🧠 ctx · 📊 cache ❄HH:MM · ⏱ session · ⌛ last
     L2  💰 block/wk/mo · 💬 session · 🔥 burn →wk · ✎ session edits · ✓ todos · 🔧 tools · 🌐 bg · 🎨 style · 📝 last skill
     L3  👥 N · ├ agent A · ├ agent B · └ agent C       (only if agents > 0)
-    L4  5h ████████  ##%  (reset countdown)
-    L5  7d ███       ##%  (reset countdown)
+    ──  gradient divider ◆
+    L4  5h    ████████  ##%  (reset countdown)
+    L5  7d    ███       ##%  (reset countdown)
+    L6+ Fable ██        ##%  (per-model weekly sub-limits, only when OMC reports them)
 
 Performance:
-- Rendering reads three JSON files (the cost/ctx cache, the plan-usage cache,
-  and settings.json) and is ~20 ms warm. Both caches are refreshed by detached
+- Rendering reads three JSON files (the local cost/transcript cache — keyed per
+  session — the plan-usage cache, and settings.json) and is ~20 ms warm. Both caches are refreshed by detached
   subprocesses, so the render path never blocks.
 - The transcript and git index are re-scanned only when their mtime changes.
 - Refreshes are single-flight: spawning a refresh worker is gated by an on-disk
@@ -30,7 +32,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.3.0"
+__version__ = "1.6.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -60,11 +62,20 @@ REFRESH_LOCK = CLAUDE_DIR / ".statusline-refresh.lock"
 USAGE_LOCK = CLAUDE_DIR / ".statusline-usage.lock"
 CACHE_STALE_SECS = 60
 BG_LOOKBACK_SECS = 30 * 60  # how far back to count bg Bash tool_uses
+# A sub-agent with no result/notification after this long is assumed dead (e.g. the
+# session was killed mid-run), so it can't haunt the agent line forever.
+AGENT_LOOKBACK_SECS = 2 * 60 * 60
+SCOPED_LABEL_MAX = 6  # per-model quota bar labels ("Fable") are truncated to this
 # Lock TTLs: a lock older than this is treated as abandoned (worker died) and
 # reclaimed. REFRESH must exceed the slowest ccusage timeout (30 s) so a healthy
 # worker is never pre-empted; USAGE only debounces the node HUD spawn.
 REFRESH_LOCK_TTL = 45
 USAGE_LOCK_TTL = 15
+# Local cache layout: account-wide ccusage fields at the top level (shared by all
+# sessions); transcript / git fields per session under "sessions".
+ACCOUNT_KEYS = ("block_cost", "burn", "monthly_cost", "plan_week_cost", "plan_week_reset")
+SESSION_CACHE_TTL = 24 * 60 * 60  # drop a session's entry after a day without refresh
+SESSION_CACHE_MAX = 30            # and keep at most this many session entries
 
 # Tree characters for agent display
 TREE_BRANCH = "├"
@@ -209,6 +220,44 @@ _CMD_RE = re.compile(
     r"<command-(?:name|message)>([a-zA-Z][a-zA-Z0-9_:.\-]{1,40})</command-(?:name|message)>"
 )
 _TASK_DONE_RE = re.compile(r"<task-id>([a-zA-Z0-9]+)</task-id>")
+_NOTIF_TOOL_RE = re.compile(r"<tool-use-id>([A-Za-z0-9_\-]+)</tool-use-id>")
+
+# Sub-agent tool name: "Task" in older Claude Code builds, "Agent" in current ones.
+AGENT_TOOLS = ("Task", "Agent")
+# Entry types that are real conversation turns. Current builds also log debug
+# records (`api-request-blob`, `api-request-shape`, ...) that replay earlier
+# messages — scanning those would double-count tool calls and bg starts.
+_TURN_TYPES = ("user", "assistant", "system")
+
+
+def _is_async_launch(tool_use_result):
+    """True when an Agent tool_result only acknowledges a *background* launch
+    ("Async agent launched ..."): the agent is still running, and its completion
+    arrives later as a <task-notification>."""
+    return isinstance(tool_use_result, dict) and (
+        tool_use_result.get("isAsync") is True
+        or tool_use_result.get("status") == "async_launched"
+    )
+
+
+def _collect_notifications(line, notified_tool_ids, attributed_task_ids, unattributed_task_ids):
+    """Harvest background-task completions from a raw transcript line.
+
+    A <task-notification> block (bg Bash exit, async agent stop) can be carried
+    by a user message with *string* content, a queued-command attachment, or a
+    queue-operation record — so the raw line is scanned, not a parsed field.
+    Current builds tag each block with the originating <tool-use-id>, which pins
+    the completion to the exact tool_use; blocks without one (older builds) only
+    yield a <task-id>, kept for the legacy count-based bg estimate."""
+    for chunk in line.split("<task-notification>")[1:]:
+        chunk = chunk.split("</task-notification>", 1)[0]
+        tool_ids = _NOTIF_TOOL_RE.findall(chunk)
+        task_ids = _TASK_DONE_RE.findall(chunk)
+        if tool_ids:
+            notified_tool_ids.update(tool_ids)
+            attributed_task_ids.update(task_ids)
+        else:
+            unattributed_task_ids.update(task_ids)
 
 
 def scan_transcript(transcript_path):
@@ -240,8 +289,10 @@ def scan_transcript(transcript_path):
     cache_read_total = 0
     cache_create_total = 0
     input_token_total = 0
-    bg_completed_in_msgs: set[str] = set()
-    bg_recent_count = 0
+    bg_completed_in_msgs: set[str] = set()   # task-ids with no tool-use-id (legacy)
+    attributed_task_ids: set[str] = set()    # task-ids pinned to a tool-use-id
+    notified_tool_ids: set[str] = set()      # tool_use ids whose bg task stopped
+    bg_recent: list = []                     # tool_use ids of recent bg Bash starts
     now_unix = time.time()
 
     try:
@@ -252,6 +303,9 @@ def scan_transcript(transcript_path):
                         and '"type"' not in line
                         and 'command-' not in line):
                     continue
+                if "<task-notification>" in line:
+                    _collect_notifications(line, notified_tool_ids,
+                                           attributed_task_ids, bg_completed_in_msgs)
                 try:
                     entry = json.loads(line)
                 except Exception:
@@ -264,6 +318,8 @@ def scan_transcript(transcript_path):
                     out["session_start_unix"] = ts_unix
 
                 etype = entry.get("type")
+                if etype not in _TURN_TYPES:
+                    continue
                 msg = entry.get("message") if isinstance(entry.get("message"), dict) else {}
                 role = msg.get("role")
                 content = msg.get("content") if isinstance(msg, dict) else None
@@ -300,8 +356,9 @@ def scan_transcript(transcript_path):
                             tid = c.get("id")
                             inp = c.get("input") if isinstance(c.get("input"), dict) else {}
 
-                            if name == "Task" and tid:
-                                sub = inp.get("subagent_type") or inp.get("description") or "agent"
+                            if name in AGENT_TOOLS and tid:
+                                sub = (inp.get("name") or inp.get("subagent_type")
+                                       or inp.get("description") or "agent")
                                 task_started[tid] = {
                                     "name": str(sub)[:14],
                                     "start_unix": ts_unix or now_unix,
@@ -314,10 +371,13 @@ def scan_transcript(transcript_path):
                                     todos_closed += 1
                             elif name == "Bash" and inp.get("run_in_background"):
                                 if ts_unix and (now_unix - ts_unix) <= BG_LOOKBACK_SECS:
-                                    bg_recent_count += 1
+                                    bg_recent.append(tid)
                         elif ctype == "tool_result":
                             tid = c.get("tool_use_id")
-                            if tid and tid in task_started:
+                            # A background launch's result is only an ack — that
+                            # agent stays running until its <task-notification>.
+                            if (tid and tid in task_started
+                                    and not _is_async_launch(entry.get("toolUseResult"))):
                                 task_finished.add(tid)
                             # Look for <task-id>X</task-id> patterns in result text
                             txt = c.get("content")
@@ -339,11 +399,15 @@ def scan_transcript(transcript_path):
     except Exception:
         pass
 
-    # Agent breakdown — only those without matching results
+    # Agent breakdown — only those with neither a result nor a stop notification,
+    # and not so old that they must have died with an earlier process.
     running = []
     for tid, info in task_started.items():
-        if tid not in task_finished:
-            running.append(info)
+        if tid in task_finished or tid in notified_tool_ids:
+            continue
+        if now_unix - info["start_unix"] > AGENT_LOOKBACK_SECS:
+            continue
+        running.append(info)
     out["agents_running"] = len(running)
     out["agent_details"] = running
 
@@ -362,8 +426,11 @@ def scan_transcript(transcript_path):
     out["todos_total"] = todos_created
     out["todos_pending"] = max(0, todos_created - todos_closed)
 
-    # bg count: rough — recent bg starts that we haven't seen a task-completion msg for.
-    out["bg_count"] = max(0, bg_recent_count - len(bg_completed_in_msgs))
+    # bg count: recent bg Bash starts whose own tool-use-id hasn't been notified as
+    # stopped, minus any completions older builds reported without a tool-use-id.
+    bg_running = sum(1 for tid in bg_recent if tid not in notified_tool_ids)
+    legacy_done = len(bg_completed_in_msgs - attributed_task_ids)
+    out["bg_count"] = max(0, bg_running - legacy_done)
     return out
 
 
@@ -427,13 +494,39 @@ def transcript_mtime(path):
 
 
 # ---------- Anthropic plan-usage cache (maintained by OMC HUD) ----------
+def _read_scoped_buckets(raw):
+    """Per-model weekly buckets from the OMC cache's `scopedWeeklyBuckets`.
+
+    OMC builds this from the usage API's `limits[]` (`kind: "weekly_scoped"`) for
+    model families it doesn't special-case — today that's "Fable". Each entry is
+    {id, label, percent, resetsAt, isActive}. Malformed entries are skipped.
+    Returns [{"label", "pct", "reset"}]."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for b in raw:
+        if not isinstance(b, dict):
+            continue
+        try:
+            pct = float(b.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        label = str(b.get("label") or b.get("id") or "").strip()
+        if not label:
+            continue
+        out.append({"label": label[:SCOPED_LABEL_MAX], "pct": pct, "reset": b.get("resetsAt")})
+    return out
+
+
 def get_plan_usage():
     info = {
         "five_pct": None, "five_reset": None,
         "wk_pct": None, "wk_reset": None,
-        # Per-model weekly sub-limit. Only the OMC usage cache carries this — the
-        # statusline stdin's rate_limits exposes five_hour/seven_day only.
+        # Per-model weekly sub-limits. Only the OMC usage cache carries these —
+        # the statusline stdin's rate_limits exposes five_hour/seven_day only.
         "sonnet_pct": None, "sonnet_reset": None,
+        "opus_pct": None, "opus_reset": None,
+        "scoped": [],          # generic per-model buckets, e.g. Fable
         "cache_age": None,
     }
     try:
@@ -445,6 +538,9 @@ def get_plan_usage():
         info["wk_reset"] = data.get("weeklyResetsAt")
         info["sonnet_pct"] = data.get("sonnetWeeklyPercent")
         info["sonnet_reset"] = data.get("sonnetWeeklyResetsAt")
+        info["opus_pct"] = data.get("opusWeeklyPercent")
+        info["opus_reset"] = data.get("opusWeeklyResetsAt")
+        info["scoped"] = _read_scoped_buckets(data.get("scopedWeeklyBuckets"))
         ts_ms = cache.get("timestamp")
         if ts_ms:
             info["cache_age"] = (time.time() * 1000 - ts_ms) / 1000
@@ -507,6 +603,46 @@ def read_local_cache():
         return json.loads(LOCAL_CACHE.read_text())
     except Exception:
         return {}
+
+
+def session_key(data):
+    """This session's slot in the local cache: the stdin `session_id`, falling
+    back to the transcript path, then a shared slot if both are absent."""
+    if not isinstance(data, dict):
+        return "_default"
+    return str(data.get("session_id") or data.get("transcript_path") or "_default")
+
+
+def session_view(cache, data):
+    """Flatten the shared local cache for one session.
+
+    The cache holds account-wide ccusage fields at the top level and every
+    session's transcript / git fields under `sessions[<session_key>]`, so
+    concurrent sessions no longer overwrite each other's tx_* numbers (and no
+    longer thrash refreshes by fighting over one transcript_mtime). A legacy
+    flat cache (pre-1.6) yields only its account fields, so another session's
+    transcript data can't leak in; the next refresh rewrites it."""
+    if not isinstance(cache, dict):
+        return {}
+    view = {k: cache[k] for k in ACCOUNT_KEYS if k in cache}
+    sessions = cache.get("sessions")
+    entry = sessions.get(session_key(data)) if isinstance(sessions, dict) else None
+    if isinstance(entry, dict):
+        view.update(entry)
+    return view
+
+
+def _prune_sessions(sessions, now):
+    """Drop session entries idle longer than SESSION_CACHE_TTL, then keep only
+    the SESSION_CACHE_MAX most recently refreshed."""
+    live = {k: v for k, v in sessions.items()
+            if isinstance(v, dict)
+            and isinstance(v.get("timestamp"), (int, float))
+            and now - v["timestamp"] <= SESSION_CACHE_TTL}
+    if len(live) > SESSION_CACHE_MAX:
+        newest = sorted(live, key=lambda k: live[k]["timestamp"], reverse=True)
+        live = {k: live[k] for k in newest[:SESSION_CACHE_MAX]}
+    return live
 
 
 def write_local_cache_atomic(data):
@@ -623,6 +759,11 @@ def _ccusage_plan_week(reset_iso):
 def refresh_local_cache(input_json):
     """Parallel: 3 ccusage calls + transcript scan + git status. Atomic write.
 
+    ccusage results are account-wide and go to the top level of the cache; the
+    transcript / git results belong to the session that spawned this worker and
+    go under `sessions[session_key(input_json)]` (see session_view). Other
+    sessions' entries are kept, minus any pruned as idle.
+
     Context is no longer fetched here — it comes live from the statusline input's
     `context_window` field on every render (see read_context_window), which is
     per-session, matches /context, and is correct on the 1M beta.
@@ -645,7 +786,7 @@ def refresh_local_cache(input_json):
             "git": lambda: get_git_status(cwd),
         }
 
-        merged = {}
+        account, session_fields = {}, {}
         with ThreadPoolExecutor(max_workers=len(tasks)) as ex:
             futs = {ex.submit(fn): name for name, fn in tasks.items()}
             for fut in as_completed(futs):
@@ -657,18 +798,32 @@ def refresh_local_cache(input_json):
                 if tag == "transcript":
                     # Namespace transcript fields under tx_ for cache clarity
                     for k, v in res.items():
-                        merged[f"tx_{k}"] = v
+                        session_fields[f"tx_{k}"] = v
                 elif tag == "git":
                     for k, v in res.items():
-                        merged[f"git_{k}"] = v
+                        session_fields[f"git_{k}"] = v
                 else:
-                    merged.update(res)
+                    account.update(res)
 
-        output = dict(prev)
-        output.update(merged)
-        output["timestamp"] = time.time()
-        output["transcript_mtime"] = transcript_mtime(transcript)
-        output["git_index_mtime"] = git_index_mtime(cwd) if cwd else None
+        now = time.time()
+        prev_sessions = prev.get("sessions") if isinstance(prev.get("sessions"), dict) else {}
+        key = session_key(input_json)
+        prev_entry = prev_sessions.get(key)
+        # Start from this session's last entry so a task that failed this round
+        # keeps its previous values instead of blanking the field.
+        entry = dict(prev_entry) if isinstance(prev_entry, dict) else {}
+        entry.update(session_fields)
+        entry["timestamp"] = now
+        entry["transcript_mtime"] = transcript_mtime(transcript)
+        entry["git_index_mtime"] = git_index_mtime(cwd) if cwd else None
+        sessions = _prune_sessions(prev_sessions, now)
+        sessions[key] = entry
+
+        # Rebuilt from scratch (not dict(prev)) so legacy flat tx_*/git_*/ctx_*
+        # keys from pre-1.6 caches don't linger forever.
+        output = {k: prev[k] for k in ACCOUNT_KEYS if k in prev}
+        output.update(account)
+        output["sessions"] = sessions
         write_local_cache_atomic(output)
     except Exception:
         pass
@@ -738,6 +893,91 @@ def _fmt_ctx_field(ctx_tokens, ctx_pct):
     return f"{ansi(*rgb_at(ctx_pct))}🧠 {body}{RESET}"
 
 
+def read_prompt_cache(data):
+    """Live prompt-cache health for this session from stdin `prompt_cache`
+    (present after the first API response; absent on older builds → None).
+
+    `hit_ratio` is the same cache_read / (read + creation + uncached input) ratio
+    the transcript scan estimates, but exact and per-session. `warm` and
+    `expires_at` are computed by Claude Code at render time; `misses` counts
+    requests whose cached prefix shrank without a compaction explaining it."""
+    pc = data.get("prompt_cache")
+    if not isinstance(pc, dict):
+        return None
+    try:
+        hit_pct = float(pc["hit_ratio"]) * 100 if pc.get("hit_ratio") is not None else None
+    except (TypeError, ValueError):
+        hit_pct = None
+    expires_at = pc.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        expires_at = None
+    try:
+        misses = int(pc.get("misses") or 0)
+    except (TypeError, ValueError):
+        misses = 0
+    return {"hit_pct": hit_pct, "warm": pc.get("warm") is True, "expires_at": expires_at,
+            "observed": pc.get("caching_observed") is True, "misses": misses}
+
+
+def fmt_clock(epoch):
+    """Local wall-clock HH:MM for a Unix epoch; '' if unparseable."""
+    try:
+        return datetime.fromtimestamp(epoch).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def _fmt_cache_field(tx_hit_pct, pc):
+    """📊 cache hit rate, plus when the cached prefix goes cold.
+
+    The live stdin `prompt_cache` wins over the transcript-derived estimate. The
+    expiry is shown as a wall-clock time (❄15:42 = "goes cold at 15:42") rather
+    than a countdown: the statusline only re-renders on events, so a countdown
+    would sit frozen while you're idle — exactly when you need to know whether
+    the next message will pay for a full cache rebuild."""
+    hit = pc["hit_pct"] if pc and pc["hit_pct"] is not None else tx_hit_pct
+    if hit is None:
+        return None
+    parts = [f"{MINT}📊 {int(round(hit))}% cache{RESET}"]
+    if pc and pc["observed"]:
+        if pc["warm"] and pc["expires_at"]:
+            clock = fmt_clock(pc["expires_at"])
+            if clock:
+                parts.append(f"{DIM}❄{clock}{RESET}")
+        elif not pc["warm"]:
+            parts.append(f"{SKY}❄ cold{RESET}")
+    if pc and pc["misses"] > 0:
+        parts.append(f"{PEACH}✗{pc['misses']}{RESET}")
+    return " ".join(parts)
+
+
+_PR_STATE = {
+    "approved": (MATCHA, "✓"),
+    "changes_requested": (PEACH, "✗"),
+    "pending": (LEMON, "…"),
+    "draft": (DIM, "draft"),
+}
+
+
+def _fmt_pr_field(data):
+    """🔀 open PR / MR for the current branch, from stdin `pr` (mirrors Claude
+    Code's footer badge): `#42` for GitHub, `!42` for a GitLab MR, plus a
+    review-state mark. None when there's no PR."""
+    pr = data.get("pr")
+    if not isinstance(pr, dict):
+        return None
+    try:
+        number = int(pr.get("number"))
+    except (TypeError, ValueError):
+        return None
+    prefix = "!" if pr.get("kind") == "mr" else "#"
+    out = f"{LAVENDER}🔀 {prefix}{number}{RESET}"
+    state = _PR_STATE.get(pr.get("review_state"))
+    if state:
+        out += f" {state[0]}{state[1]}{RESET}"
+    return out
+
+
 def _fmt_git_field(cache):
     branch = cache.get("git_branch")
     if not branch:
@@ -788,6 +1028,24 @@ def _fmt_bar(label, pct, reset):
             f"{DIM}({fmt_remaining(remain)}){RESET}")
 
 
+def _fmt_divider(width):
+    """A rule between the status text and the quota bars. The text fields and the
+    bar labels share the macaron greens, so the eye reads the left edge as one
+    block; this rule caps the text and marks where the bars begin.
+
+    It carries the same green→amber→pink gradient as the bars (rgb_at by column),
+    so it reads as the bars' header, with a small ◆ centered as a focal point.
+    Width spans the label + bar track so it sits directly over the bars."""
+    width = max(0, width)
+    cells = [f"{ansi(*rgb_at((i / max(width - 1, 1)) * 100))}─" for i in range(width)]
+    if width >= 3:
+        mid = width // 2
+        cells[mid] = f"{ansi(*rgb_at(50))}◆"
+        cells[mid - 1] = " "  # breathing room around the focal point
+        cells[mid + 1] = " "
+    return "".join(cells) + RESET
+
+
 def render(data, cache, plan):
     model = data.get("model", {}).get("display_name", "Claude")
     effort = get_effort(data)
@@ -825,6 +1083,7 @@ def render(data, cache, plan):
     out_style = data.get("output_style") if isinstance(data.get("output_style"), dict) else {}
     style_name = out_style.get("name")
     exceeds_200k = bool(data.get("exceeds_200k_tokens"))
+    fast_on = data.get("fast_mode") is True
 
     # Account-wide cost (from cache / ccusage): current block, plan week, month.
     block_cost = cache.get("block_cost")
@@ -843,18 +1102,25 @@ def render(data, cache, plan):
     effort_str = f"{PEACH}⚡ {effort}{RESET}"
     if thinking_on:
         effort_str += " 💭"
-    l1_fields = [model_str, effort_str]
+    l1_fields = [model_str]
+    if fast_on:
+        l1_fields.append(f"{LEMON}🚀 fast{RESET}")  # fast mode: quicker, pricier output
+    l1_fields.append(effort_str)
     git_field = _fmt_git_field(cache)
     if git_field:
         l1_fields.append(f"{SKY}{git_field}{RESET}")
+    pr_field = _fmt_pr_field(data)
+    if pr_field:
+        l1_fields.append(pr_field)
     # exceeds_200k_tokens is redundant with a live % (it just means >200k used),
     # so surface it only as a coarse signal when no context_window % is available.
     if ctx_pct is None and exceeds_200k:
         l1_fields.append(f"🧠 {DIM}>200k{RESET}")
     else:
         l1_fields.append(_fmt_ctx_field(ctx_tokens, ctx_pct))
-    if cache_hit is not None:
-        l1_fields.append(f"{MINT}📊 {int(round(cache_hit))}% cache{RESET}")
+    cache_field = _fmt_cache_field(cache_hit, read_prompt_cache(data))
+    if cache_field:
+        l1_fields.append(cache_field)
     if session_start:
         l1_fields.append(f"{LAVENDER}⏱ {session_dur}{RESET}")
     if last_latency:
@@ -891,25 +1157,34 @@ def render(data, cache, plan):
         line3 = f"{LAVENDER}👥 {agents_running}{RESET}  " + "  ".join(nodes)
 
     # --- Bars ---
-    # 5h + 7d (overall) always; Sonnet weekly sub-limit only when the OMC usage
-    # cache provides it (stdin rate_limits has no per-model breakdown).
+    # 5h + 7d (overall) always; per-model weekly sub-limits (Sonnet / Opus /
+    # generic buckets such as Fable) only when the OMC usage cache provides them —
+    # stdin rate_limits has no per-model breakdown.
     bar_specs = [
         ("5h", plan["five_pct"], plan["five_reset"]),
         ("7d", plan["wk_pct"], plan["wk_reset"]),
     ]
     if plan.get("sonnet_pct") is not None:
         bar_specs.append(("Son", plan["sonnet_pct"], plan["sonnet_reset"]))
+    if plan.get("opus_pct") is not None:
+        bar_specs.append(("Opus", plan["opus_pct"], plan["opus_reset"]))
+    for bucket in plan.get("scoped") or []:
+        bar_specs.append((bucket["label"], bucket["pct"], bucket["reset"]))
     pad = max(len(lbl) for lbl, _, _ in bar_specs)
     bars = [_fmt_bar(lbl.ljust(pad), pct, reset) for lbl, pct, reset in bar_specs]
 
     lines = [line1, line2]
     if line3:
         lines.append(line3)
+    lines.append(_fmt_divider(pad + 2 + BAR_WIDTH))
     lines.extend(bars)
     return "\n".join(lines)
 
 
 def needs_refresh(data, cache, plan):
+    # `cache` is this session's flattened view (session_view), so the timestamp
+    # and mtimes compared here are this session's own — another session's
+    # refresh no longer makes this one look stale.
     # Time-based
     cache_ts = cache.get("timestamp")
     if cache_ts is None or (time.time() - cache_ts) > CACHE_STALE_SECS:
@@ -934,15 +1209,19 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         data = {}
+    if not isinstance(data, dict):
+        # Valid JSON that isn't an object ([], "x", null) would otherwise crash the
+        # pre-render reads (data.get) outside render()'s try — and print a traceback.
+        data = {}
 
     if "--refresh" in sys.argv[1:]:
         refresh_local_cache(data)
         return 0
 
-    cache = read_local_cache()
+    cache = session_view(read_local_cache(), data)
     plan = get_plan_usage()
     # Prefer live 5h/7d quota straight from stdin (real-time); the OMC cache
-    # still supplies the per-model Sonnet bar, which stdin doesn't carry.
+    # still supplies the per-model bars (Fable, Sonnet…), which stdin doesn't carry.
     live_rl = read_rate_limits(data)
     if live_rl:
         plan = {**plan, **live_rl}
@@ -965,9 +1244,9 @@ def main():
         if (OMC_HUD.exists()
                 and (plan["cache_age"] is None or plan["cache_age"] > CACHE_STALE_SECS)
                 and try_acquire_lock(USAGE_LOCK, USAGE_LOCK_TTL)):
-            # Keep the OMC usage cache fresh: it's the only source of the Sonnet
-            # weekly sub-limit (stdin rate_limits has no per-model breakdown) and
-            # the 5h/7d fallback. The node HUD worker can't release our lock; it
+            # Keep the OMC usage cache fresh: it's the only source of the
+            # per-model weekly sub-limits such as Fable (stdin rate_limits has no
+            # per-model breakdown) and the 5h/7d fallback. The node HUD worker can't release our lock; it
             # expires via TTL.
             refresh_usage_cache_async(data)
     except Exception:
