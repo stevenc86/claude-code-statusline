@@ -33,6 +33,11 @@ def tearDownModule():
     shutil.rmtree(_SCRATCH, ignore_errors=True)
 
 
+def _strip_ansi(s):
+    import re
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
 class FakeRun:
     """Stand-in for subprocess.run's CompletedProcess (only .stdout is read)."""
 
@@ -158,11 +163,13 @@ class ScanTranscriptTests(unittest.TestCase):
         self.assertEqual(out["last_slash"], "-")
 
     def test_full_scan(self):
+        # Recent timestamps: an unfinished agent older than AGENT_LOOKBACK_SECS is
+        # (correctly) treated as dead, so a fixed historical date would drop it.
         path = self._write([
-            {"type": "user", "timestamp": "2026-05-29T00:00:00Z",
+            {"type": "user", "timestamp": self._ts(65),
              "message": {"role": "user",
                          "content": [{"type": "text", "text": "<command-name>admin-login</command-name>"}]}},
-            {"type": "assistant", "timestamp": "2026-05-29T00:00:05Z",
+            {"type": "assistant", "timestamp": self._ts(60),
              "message": {"role": "assistant",
                          "usage": {"input_tokens": 100, "cache_read_input_tokens": 900},
                          "content": [
@@ -191,6 +198,122 @@ class ScanTranscriptTests(unittest.TestCase):
                          "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "done"}]}},
         ])
         out = sl.scan_transcript(path)
+        self.assertEqual(out["agents_running"], 0)
+
+    # --- current builds: sub-agent tool is "Agent", often launched async ---
+
+    @staticmethod
+    def _ts(ago_secs=0):
+        t = time.time() - ago_secs
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+
+    def _agent_use(self, tid="toolu_A1", ago=60, **inp):
+        return {"type": "assistant", "timestamp": self._ts(ago),
+                "message": {"role": "assistant",
+                            "content": [{"type": "tool_use", "id": tid, "name": "Agent",
+                                         "input": {"description": "Review the diff",
+                                                   "subagent_type": "code-reviewer", **inp}}]}}
+
+    def _async_ack(self, tid="toolu_A1"):
+        return {"type": "user", "timestamp": self._ts(55),
+                "message": {"role": "user",
+                            "content": [{"type": "tool_result", "tool_use_id": tid,
+                                         "content": [{"type": "text",
+                                                      "text": "Async agent launched successfully."}]}]},
+                "toolUseResult": {"isAsync": True, "status": "async_launched",
+                                  "agentId": "a1b2c3"}}
+
+    @staticmethod
+    def _notification(tid="toolu_A1", task_id="a1b2c3", status="completed"):
+        return (f"<task-notification>\n<task-id>{task_id}</task-id>\n"
+                f"<tool-use-id>{tid}</tool-use-id>\n<status>{status}</status>\n"
+                f"<summary>done</summary>\n</task-notification>")
+
+    def test_agent_tool_counts_as_running_agent(self):
+        path = self._write([self._agent_use()])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["agents_running"], 1)
+        self.assertEqual(out["agent_details"][0]["name"], "code-reviewer")
+
+    def test_agent_name_preferred_over_subagent_type(self):
+        path = self._write([self._agent_use(name="selfreview")])
+        self.assertEqual(sl.scan_transcript(path)["agent_details"][0]["name"], "selfreview")
+
+    def test_async_agent_stays_running_after_launch_ack(self):
+        # The tool_result of a background launch is only an ack, not completion.
+        path = self._write([self._agent_use(), self._async_ack()])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 1)
+
+    def test_async_agent_cleared_by_user_string_notification(self):
+        path = self._write([
+            self._agent_use(), self._async_ack(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user", "content": self._notification()}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_async_agent_cleared_by_queued_attachment_notification(self):
+        # Delivered mid-turn, the notification lands in an attachment record.
+        path = self._write([
+            self._agent_use(), self._async_ack(),
+            {"type": "attachment", "timestamp": self._ts(5),
+             "attachment": {"type": "queued_command", "prompt": self._notification()}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_sync_agent_result_clears_running(self):
+        path = self._write([
+            self._agent_use(),
+            {"type": "user", "timestamp": self._ts(30),
+             "message": {"role": "user",
+                         "content": [{"type": "tool_result", "tool_use_id": "toolu_A1",
+                                      "content": "review done"}]}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_ancient_unfinished_agent_is_dropped(self):
+        ago = sl.AGENT_LOOKBACK_SECS + 600
+        path = self._write([self._agent_use(ago=ago)])
+        self.assertEqual(sl.scan_transcript(path)["agents_running"], 0)
+
+    def test_debug_request_records_are_not_double_counted(self):
+        # `api-request-blob` replays earlier messages, tool_use blocks included.
+        use = self._agent_use()
+        blob = {"type": "api-request-blob", "timestamp": self._ts(1),
+                "message": {"role": "user", "content": use["message"]["content"]}}
+        path = self._write([use, blob])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["tool_count"], 1)
+
+    def _bg_bash(self, tid="toolu_B1"):
+        return {"type": "assistant", "timestamp": self._ts(60),
+                "message": {"role": "assistant",
+                            "content": [{"type": "tool_use", "id": tid, "name": "Bash",
+                                         "input": {"command": "sleep 99",
+                                                   "run_in_background": True}}]}}
+
+    def test_bg_bash_running_until_notified(self):
+        path = self._write([self._bg_bash()])
+        self.assertEqual(sl.scan_transcript(path)["bg_count"], 1)
+
+    def test_bg_bash_cleared_by_tool_use_id_notification(self):
+        path = self._write([
+            self._bg_bash(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user",
+                         "content": self._notification(tid="toolu_B1", task_id="b9")}},
+        ])
+        self.assertEqual(sl.scan_transcript(path)["bg_count"], 0)
+
+    def test_agent_notification_does_not_clear_bg_bash(self):
+        # A completed *agent* must not be subtracted from the running bg Bash count.
+        path = self._write([
+            self._bg_bash(), self._agent_use(), self._async_ack(),
+            {"type": "user", "timestamp": self._ts(5),
+             "message": {"role": "user", "content": self._notification()}},
+        ])
+        out = sl.scan_transcript(path)
+        self.assertEqual(out["bg_count"], 1)
         self.assertEqual(out["agents_running"], 0)
 
 
@@ -324,6 +447,23 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("Son", out)
         self.assertEqual(out.count("\n") + 1, 5)  # 2 status lines + divider + 2 bars
 
+    def test_scoped_fable_bar_shown_and_aligned(self):
+        plan = {**self._plan(),
+                "scoped": [{"label": "Fable", "pct": 49.0, "reset": None}]}
+        out = sl.render({"model": {"display_name": "X"}}, {}, plan)
+        rows = [_strip_ansi(r) for r in out.split("\n")]
+        bar_rows = [r for r in rows if r.startswith(("5h", "7d", "Fable"))]
+        self.assertEqual(len(bar_rows), 3)
+        self.assertIn("49%", bar_rows[-1])
+        # Labels are padded to the longest one, so every bar track (first fill
+        # char) starts at the same column: label width + 2-space gap.
+        self.assertEqual({r.index(sl.FILL_CHAR) for r in bar_rows}, {len("Fable") + 2})
+        self.assertEqual(out.count("\n") + 1, 6)  # 2 status lines + divider + 3 bars
+
+    def test_opus_bar_shown_when_present(self):
+        plan = {**self._plan(), "opus_pct": 12.0, "opus_reset": None}
+        self.assertIn("Opus", sl.render({"model": {"display_name": "X"}}, {}, plan))
+
     def test_divider_separates_text_from_bars(self):
         out = sl.render({"model": {"display_name": "X"}}, {}, self._plan())
         rows = out.split("\n")
@@ -424,6 +564,33 @@ class PlanUsageTests(unittest.TestCase):
     def test_missing_sonnet_is_none(self):
         sl.USAGE_CACHE.write_text(json.dumps({"data": {"weeklyPercent": 59}}))
         self.assertIsNone(sl.get_plan_usage()["sonnet_pct"])
+        self.assertEqual(sl.get_plan_usage()["scoped"], [])
+
+    def test_reads_scoped_fable_bucket_from_omc_cache(self):
+        # Shape written by OMC 5.7.x from the usage API's limits[] weekly_scoped rows.
+        sl.USAGE_CACHE.write_text(json.dumps({
+            "timestamp": int(time.time() * 1000),
+            "data": {"fiveHourPercent": 14, "weeklyPercent": 32,
+                     "scopedWeeklyBuckets": [
+                         {"id": "fable", "label": "Fable", "percent": 49,
+                          "resetsAt": "2026-11-10T10:00:00.446Z", "isActive": True}]},
+        }))
+        info = sl.get_plan_usage()
+        self.assertEqual(info["scoped"], [
+            {"label": "Fable", "pct": 49.0, "reset": "2026-11-10T10:00:00.446Z"}])
+        self.assertIsNone(info["sonnet_pct"])
+
+    def test_malformed_scoped_buckets_are_skipped(self):
+        sl.USAGE_CACHE.write_text(json.dumps({"data": {"scopedWeeklyBuckets": [
+            "nope", {"label": "NoPct"}, {"label": "", "percent": 5},
+            {"id": "x", "label": "Extremely Long Name", "percent": "7"},
+        ]}}))
+        self.assertEqual(sl.get_plan_usage()["scoped"], [
+            {"label": "Extrem", "pct": 7.0, "reset": None}])
+
+    def test_scoped_buckets_not_a_list_is_safe(self):
+        sl.USAGE_CACHE.write_text(json.dumps({"data": {"scopedWeeklyBuckets": {"a": 1}}}))
+        self.assertEqual(sl.get_plan_usage()["scoped"], [])
 
 
 class NeedsRefreshTests(unittest.TestCase):

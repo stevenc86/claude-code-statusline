@@ -5,8 +5,10 @@ Layout (lines printed top → bottom):
     L1  🤖 model v · ⚡ effort 💭 · ⎇ branch · 🧠 ctx · 📊 cache · ⏱ session · ⌛ last
     L2  💰 block/wk/mo · 💬 session · 🔥 burn →wk · ✎ session edits · ✓ todos · 🔧 tools · 🌐 bg · 🎨 style · 📝 last skill
     L3  👥 N · ├ agent A · ├ agent B · └ agent C       (only if agents > 0)
-    L4  5h ████████  ##%  (reset countdown)
-    L5  7d ███       ##%  (reset countdown)
+    ──  gradient divider ◆
+    L4  5h    ████████  ##%  (reset countdown)
+    L5  7d    ███       ##%  (reset countdown)
+    L6+ Fable ██        ##%  (per-model weekly sub-limits, only when OMC reports them)
 
 Performance:
 - Rendering reads three JSON files (the cost/ctx cache, the plan-usage cache,
@@ -30,7 +32,7 @@ from pathlib import Path
 # concurrent.futures / tempfile / timedelta are imported lazily inside the
 # refresh path only; keeping them off the hot render path saves ~7 ms/render.
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # ---------- visual config ----------
 BAR_WIDTH = 30
@@ -60,6 +62,10 @@ REFRESH_LOCK = CLAUDE_DIR / ".statusline-refresh.lock"
 USAGE_LOCK = CLAUDE_DIR / ".statusline-usage.lock"
 CACHE_STALE_SECS = 60
 BG_LOOKBACK_SECS = 30 * 60  # how far back to count bg Bash tool_uses
+# A sub-agent with no result/notification after this long is assumed dead (e.g. the
+# session was killed mid-run), so it can't haunt the agent line forever.
+AGENT_LOOKBACK_SECS = 2 * 60 * 60
+SCOPED_LABEL_MAX = 6  # per-model quota bar labels ("Fable") are truncated to this
 # Lock TTLs: a lock older than this is treated as abandoned (worker died) and
 # reclaimed. REFRESH must exceed the slowest ccusage timeout (30 s) so a healthy
 # worker is never pre-empted; USAGE only debounces the node HUD spawn.
@@ -209,6 +215,44 @@ _CMD_RE = re.compile(
     r"<command-(?:name|message)>([a-zA-Z][a-zA-Z0-9_:.\-]{1,40})</command-(?:name|message)>"
 )
 _TASK_DONE_RE = re.compile(r"<task-id>([a-zA-Z0-9]+)</task-id>")
+_NOTIF_TOOL_RE = re.compile(r"<tool-use-id>([A-Za-z0-9_\-]+)</tool-use-id>")
+
+# Sub-agent tool name: "Task" in older Claude Code builds, "Agent" in current ones.
+AGENT_TOOLS = ("Task", "Agent")
+# Entry types that are real conversation turns. Current builds also log debug
+# records (`api-request-blob`, `api-request-shape`, ...) that replay earlier
+# messages — scanning those would double-count tool calls and bg starts.
+_TURN_TYPES = ("user", "assistant", "system")
+
+
+def _is_async_launch(tool_use_result):
+    """True when an Agent tool_result only acknowledges a *background* launch
+    ("Async agent launched ..."): the agent is still running, and its completion
+    arrives later as a <task-notification>."""
+    return isinstance(tool_use_result, dict) and (
+        tool_use_result.get("isAsync") is True
+        or tool_use_result.get("status") == "async_launched"
+    )
+
+
+def _collect_notifications(line, notified_tool_ids, attributed_task_ids, unattributed_task_ids):
+    """Harvest background-task completions from a raw transcript line.
+
+    A <task-notification> block (bg Bash exit, async agent stop) can be carried
+    by a user message with *string* content, a queued-command attachment, or a
+    queue-operation record — so the raw line is scanned, not a parsed field.
+    Current builds tag each block with the originating <tool-use-id>, which pins
+    the completion to the exact tool_use; blocks without one (older builds) only
+    yield a <task-id>, kept for the legacy count-based bg estimate."""
+    for chunk in line.split("<task-notification>")[1:]:
+        chunk = chunk.split("</task-notification>", 1)[0]
+        tool_ids = _NOTIF_TOOL_RE.findall(chunk)
+        task_ids = _TASK_DONE_RE.findall(chunk)
+        if tool_ids:
+            notified_tool_ids.update(tool_ids)
+            attributed_task_ids.update(task_ids)
+        else:
+            unattributed_task_ids.update(task_ids)
 
 
 def scan_transcript(transcript_path):
@@ -240,8 +284,10 @@ def scan_transcript(transcript_path):
     cache_read_total = 0
     cache_create_total = 0
     input_token_total = 0
-    bg_completed_in_msgs: set[str] = set()
-    bg_recent_count = 0
+    bg_completed_in_msgs: set[str] = set()   # task-ids with no tool-use-id (legacy)
+    attributed_task_ids: set[str] = set()    # task-ids pinned to a tool-use-id
+    notified_tool_ids: set[str] = set()      # tool_use ids whose bg task stopped
+    bg_recent: list = []                     # tool_use ids of recent bg Bash starts
     now_unix = time.time()
 
     try:
@@ -252,6 +298,9 @@ def scan_transcript(transcript_path):
                         and '"type"' not in line
                         and 'command-' not in line):
                     continue
+                if "<task-notification>" in line:
+                    _collect_notifications(line, notified_tool_ids,
+                                           attributed_task_ids, bg_completed_in_msgs)
                 try:
                     entry = json.loads(line)
                 except Exception:
@@ -264,6 +313,8 @@ def scan_transcript(transcript_path):
                     out["session_start_unix"] = ts_unix
 
                 etype = entry.get("type")
+                if etype not in _TURN_TYPES:
+                    continue
                 msg = entry.get("message") if isinstance(entry.get("message"), dict) else {}
                 role = msg.get("role")
                 content = msg.get("content") if isinstance(msg, dict) else None
@@ -300,8 +351,9 @@ def scan_transcript(transcript_path):
                             tid = c.get("id")
                             inp = c.get("input") if isinstance(c.get("input"), dict) else {}
 
-                            if name == "Task" and tid:
-                                sub = inp.get("subagent_type") or inp.get("description") or "agent"
+                            if name in AGENT_TOOLS and tid:
+                                sub = (inp.get("name") or inp.get("subagent_type")
+                                       or inp.get("description") or "agent")
                                 task_started[tid] = {
                                     "name": str(sub)[:14],
                                     "start_unix": ts_unix or now_unix,
@@ -314,10 +366,13 @@ def scan_transcript(transcript_path):
                                     todos_closed += 1
                             elif name == "Bash" and inp.get("run_in_background"):
                                 if ts_unix and (now_unix - ts_unix) <= BG_LOOKBACK_SECS:
-                                    bg_recent_count += 1
+                                    bg_recent.append(tid)
                         elif ctype == "tool_result":
                             tid = c.get("tool_use_id")
-                            if tid and tid in task_started:
+                            # A background launch's result is only an ack — that
+                            # agent stays running until its <task-notification>.
+                            if (tid and tid in task_started
+                                    and not _is_async_launch(entry.get("toolUseResult"))):
                                 task_finished.add(tid)
                             # Look for <task-id>X</task-id> patterns in result text
                             txt = c.get("content")
@@ -339,11 +394,15 @@ def scan_transcript(transcript_path):
     except Exception:
         pass
 
-    # Agent breakdown — only those without matching results
+    # Agent breakdown — only those with neither a result nor a stop notification,
+    # and not so old that they must have died with an earlier process.
     running = []
     for tid, info in task_started.items():
-        if tid not in task_finished:
-            running.append(info)
+        if tid in task_finished or tid in notified_tool_ids:
+            continue
+        if now_unix - info["start_unix"] > AGENT_LOOKBACK_SECS:
+            continue
+        running.append(info)
     out["agents_running"] = len(running)
     out["agent_details"] = running
 
@@ -362,8 +421,11 @@ def scan_transcript(transcript_path):
     out["todos_total"] = todos_created
     out["todos_pending"] = max(0, todos_created - todos_closed)
 
-    # bg count: rough — recent bg starts that we haven't seen a task-completion msg for.
-    out["bg_count"] = max(0, bg_recent_count - len(bg_completed_in_msgs))
+    # bg count: recent bg Bash starts whose own tool-use-id hasn't been notified as
+    # stopped, minus any completions older builds reported without a tool-use-id.
+    bg_running = sum(1 for tid in bg_recent if tid not in notified_tool_ids)
+    legacy_done = len(bg_completed_in_msgs - attributed_task_ids)
+    out["bg_count"] = max(0, bg_running - legacy_done)
     return out
 
 
@@ -427,13 +489,39 @@ def transcript_mtime(path):
 
 
 # ---------- Anthropic plan-usage cache (maintained by OMC HUD) ----------
+def _read_scoped_buckets(raw):
+    """Per-model weekly buckets from the OMC cache's `scopedWeeklyBuckets`.
+
+    OMC builds this from the usage API's `limits[]` (`kind: "weekly_scoped"`) for
+    model families it doesn't special-case — today that's "Fable". Each entry is
+    {id, label, percent, resetsAt, isActive}. Malformed entries are skipped.
+    Returns [{"label", "pct", "reset"}]."""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for b in raw:
+        if not isinstance(b, dict):
+            continue
+        try:
+            pct = float(b.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        label = str(b.get("label") or b.get("id") or "").strip()
+        if not label:
+            continue
+        out.append({"label": label[:SCOPED_LABEL_MAX], "pct": pct, "reset": b.get("resetsAt")})
+    return out
+
+
 def get_plan_usage():
     info = {
         "five_pct": None, "five_reset": None,
         "wk_pct": None, "wk_reset": None,
-        # Per-model weekly sub-limit. Only the OMC usage cache carries this — the
-        # statusline stdin's rate_limits exposes five_hour/seven_day only.
+        # Per-model weekly sub-limits. Only the OMC usage cache carries these —
+        # the statusline stdin's rate_limits exposes five_hour/seven_day only.
         "sonnet_pct": None, "sonnet_reset": None,
+        "opus_pct": None, "opus_reset": None,
+        "scoped": [],          # generic per-model buckets, e.g. Fable
         "cache_age": None,
     }
     try:
@@ -445,6 +533,9 @@ def get_plan_usage():
         info["wk_reset"] = data.get("weeklyResetsAt")
         info["sonnet_pct"] = data.get("sonnetWeeklyPercent")
         info["sonnet_reset"] = data.get("sonnetWeeklyResetsAt")
+        info["opus_pct"] = data.get("opusWeeklyPercent")
+        info["opus_reset"] = data.get("opusWeeklyResetsAt")
+        info["scoped"] = _read_scoped_buckets(data.get("scopedWeeklyBuckets"))
         ts_ms = cache.get("timestamp")
         if ts_ms:
             info["cache_age"] = (time.time() * 1000 - ts_ms) / 1000
@@ -909,14 +1000,19 @@ def render(data, cache, plan):
         line3 = f"{LAVENDER}👥 {agents_running}{RESET}  " + "  ".join(nodes)
 
     # --- Bars ---
-    # 5h + 7d (overall) always; Sonnet weekly sub-limit only when the OMC usage
-    # cache provides it (stdin rate_limits has no per-model breakdown).
+    # 5h + 7d (overall) always; per-model weekly sub-limits (Sonnet / Opus /
+    # generic buckets such as Fable) only when the OMC usage cache provides them —
+    # stdin rate_limits has no per-model breakdown.
     bar_specs = [
         ("5h", plan["five_pct"], plan["five_reset"]),
         ("7d", plan["wk_pct"], plan["wk_reset"]),
     ]
     if plan.get("sonnet_pct") is not None:
         bar_specs.append(("Son", plan["sonnet_pct"], plan["sonnet_reset"]))
+    if plan.get("opus_pct") is not None:
+        bar_specs.append(("Opus", plan["opus_pct"], plan["opus_reset"]))
+    for bucket in plan.get("scoped") or []:
+        bar_specs.append((bucket["label"], bucket["pct"], bucket["reset"]))
     pad = max(len(lbl) for lbl, _, _ in bar_specs)
     bars = [_fmt_bar(lbl.ljust(pad), pct, reset) for lbl, pct, reset in bar_specs]
 
@@ -961,7 +1057,7 @@ def main():
     cache = read_local_cache()
     plan = get_plan_usage()
     # Prefer live 5h/7d quota straight from stdin (real-time); the OMC cache
-    # still supplies the per-model Sonnet bar, which stdin doesn't carry.
+    # still supplies the per-model bars (Fable, Sonnet…), which stdin doesn't carry.
     live_rl = read_rate_limits(data)
     if live_rl:
         plan = {**plan, **live_rl}
@@ -984,9 +1080,9 @@ def main():
         if (OMC_HUD.exists()
                 and (plan["cache_age"] is None or plan["cache_age"] > CACHE_STALE_SECS)
                 and try_acquire_lock(USAGE_LOCK, USAGE_LOCK_TTL)):
-            # Keep the OMC usage cache fresh: it's the only source of the Sonnet
-            # weekly sub-limit (stdin rate_limits has no per-model breakdown) and
-            # the 5h/7d fallback. The node HUD worker can't release our lock; it
+            # Keep the OMC usage cache fresh: it's the only source of the
+            # per-model weekly sub-limits such as Fable (stdin rate_limits has no
+            # per-model breakdown) and the 5h/7d fallback. The node HUD worker can't release our lock; it
             # expires via TTL.
             refresh_usage_cache_async(data)
     except Exception:
